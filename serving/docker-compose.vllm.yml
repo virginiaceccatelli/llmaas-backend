@@ -1,0 +1,51 @@
+# Runs on the GPU SERVING VM, not on the gateway VM.
+#
+#   scp -r serving/ gpu-vm:~/  &&  ssh gpu-vm
+#   cd serving && docker compose -f docker-compose.vllm.yml up -d
+#
+# Prerequisites on that VM: NVIDIA driver + NVIDIA Container Toolkit.
+# The GPU is attached to the VM via PCI passthrough (see architecture.md).
+
+services:
+  vllm-qwen:
+    image: vllm/vllm-openai:latest        # PIN a version tag before production
+    runtime: nvidia
+    environment:
+      # Needed only for gated/private repos; Qwen2.5-Instruct is open.
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      # Cache weights on the host so restarts don't re-download ~15GB.
+      - hf-cache:/root/.cache/huggingface
+    ports:
+      # Bind to the PRIVATE interface only. Never 0.0.0.0 on a public VM.
+      - "${PRIVATE_IP:-127.0.0.1}:8000:8000"
+    ipc: host                              # vLLM needs a large /dev/shm
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command:
+      - --model=Qwen/Qwen2.5-7B-Instruct
+      - --served-model-name=Qwen/Qwen2.5-7B-Instruct
+      - --host=0.0.0.0
+      - --port=8000
+      # Shared secret the broker presents. Keep it in Vault.
+      - --api-key=${VLLM_API_KEY}
+      # --- isolation settings from architecture.md -----------------------
+      # Do not log prompts/completions anywhere on the GPU VM.
+      - --disable-log-requests
+      # --- capacity tuning ----------------------------------------------
+      - --gpu-memory-utilization=0.90
+      - --max-model-len=8192
+      # EXTEND for multi-GPU: --tensor-parallel-size=2
+    restart: unless-stopped
+
+  # EXTEND: a second model = a second service on port 8001 with its own
+  # --model and its own GPU (`device_ids: ["1"]`). One process per model is
+  # what guarantees no shared state between models.
+
+volumes:
+  hf-cache:

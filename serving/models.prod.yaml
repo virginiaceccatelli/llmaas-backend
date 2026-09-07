@@ -1,0 +1,25 @@
+# PRODUCTION model registry — points at the real vLLM instances on the GPU VM(s).
+#
+# One entry per vLLM process. Each process serves exactly one model on its own
+# port, which is the model-isolation boundary from architecture.md.
+#
+# Switch to this file by setting MODELS_FILE / changing the compose mount:
+#   ./serving/models.prod.yaml:/srv/models.yaml:ro
+
+models:
+  qwen-instruct:
+    kind: vllm                          # enables per-tenant cache_salt
+    base_url: http://${VLLM_QWEN_HOST}:8000/v1
+    upstream_model: Qwen/Qwen2.5-7B-Instruct
+    # vLLM's own --api-key. This is the broker's credential for the GPU VM;
+    # it is NOT any customer's key. Store it in Vault, inject as an env var.
+    api_key: ${VLLM_API_KEY}
+
+  # EXTEND: adding a model = start another vLLM container on a free GPU/port
+  # and add four lines here. No broker code changes.
+  #
+  # qwen-coder:
+  #   kind: vllm
+  #   base_url: http://${VLLM_QWEN_HOST}:8001/v1
+  #   upstream_model: Qwen/Qwen2.5-Coder-7B-Instruct
+  #   api_key: ${VLLM_API_KEY}

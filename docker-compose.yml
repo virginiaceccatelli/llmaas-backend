@@ -1,0 +1,74 @@
+# The Gateway/Broker VM stack.
+#
+# Everything here runs on ONE VM on the private network. Nothing in this file
+# should be published on a public interface — the frontend VM is the only
+# thing that talks to it.
+#
+#   docker compose up --build
+#
+# Host port bindings below are all 127.0.0.1 so that on a real VM they are
+# reachable only from the VM itself; the broker is reached by other VMs over
+# the private network, which you configure with a security group, not here.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-llmaas}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-llmaas}
+      POSTGRES_DB: ${POSTGRES_DB:-llmaas}
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"      # local inspection only; drop in production
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-llmaas}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"      # local inspection only; drop in production
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  broker:
+    build: ./broker
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-llmaas}:${POSTGRES_PASSWORD:-llmaas}@postgres:5432/${POSTGRES_DB:-llmaas}
+      REDIS_URL: redis://redis:6379/0
+      MODELS_FILE: /srv/models.yaml
+    volumes:
+      # DEV: Hugging Face upstream, no GPU needed.
+      # PROD: swap to ./serving/models.prod.yaml to hit the real vLLM VM.
+      - ./serving/models.dev.yaml:/srv/models.yaml:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    restart: unless-stopped
+
+  # EXTEND — HashiCorp Vault. Until this exists, secrets come from .env, which
+  # is fine for a PoC and not fine for production. Uncomment, then have the
+  # broker read VLLM_API_KEY / HF_TOKEN / DB password from Vault at startup
+  # instead of from the environment.
+  #
+  # vault:
+  #   image: hashicorp/vault:1.18
+  #   cap_add: [IPC_LOCK]
+  #   ports:
+  #     - "127.0.0.1:8200:8200"
+  #   environment:
+  #     VAULT_DEV_ROOT_TOKEN_ID: dev-only-root-token   # dev mode: in-memory!
+  #   command: server -dev -dev-listen-address=0.0.0.0:8200
+
+volumes:
+  pgdata:

@@ -1,0 +1,30 @@
+# DEV model registry — no GPU required.
+#
+# Routes our public model name to Hugging Face's OpenAI-compatible Inference
+# Providers router, so the whole auth/rate-limit/metering/billing path can be
+# exercised on a laptop before any GPU VM exists.
+#
+# REQUIRES A THIRD-PARTY ACCOUNT: huggingface.co
+#   1. Create a free account.
+#   2. Settings -> Access Tokens -> create a token with the
+#      "Make calls to Inference Providers" permission.
+#   3. Put it in .env as HF_TOKEN=hf_xxx  (never commit it).
+#
+# Note: which exact Qwen checkpoints are servable through the HF router changes
+# over time. Check https://huggingface.co/models?inference_provider=all and
+# adjust `upstream_model` if a call returns "model not supported".
+
+models:
+  qwen-instruct:
+    kind: openai                       # not vLLM -> do not send cache_salt
+    base_url: https://router.huggingface.co/v1
+    upstream_model: Qwen/Qwen2.5-7B-Instruct
+    api_key: ${HF_TOKEN}
+
+  # A second entry purely to prove multi-model routing works. Same upstream
+  # here; in prod each of these is a different vLLM process on a different GPU.
+  qwen-small:
+    kind: openai
+    base_url: https://router.huggingface.co/v1
+    upstream_model: Qwen/Qwen2.5-1.5B-Instruct
+    api_key: ${HF_TOKEN}
