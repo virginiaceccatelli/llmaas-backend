@@ -7,18 +7,29 @@ Walks the whole flow: mint a key -> list keys -> call the model with that key
 -> check usage was recorded -> revoke the key -> confirm it now fails.
 """
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8080"
 
+# With AUTH_MODE=hs256/oidc the control-plane endpoints need a real token:
+#   $env:LLMAAS_CONTROL_TOKEN = (python scripts\make_token.py --user alice)
+# With AUTH_MODE=dev, leave it unset and the X-Dev-User header is used.
+CONTROL_TOKEN = os.environ.get("LLMAAS_CONTROL_TOKEN", "")
+
 
 def call(method: str, path: str, body=None, token=None, user="demo-user"):
     req = urllib.request.Request(BASE + path, method=method)
-    req.add_header("X-Dev-User", user)          # dev-auth stub; see docs/AUTH.md
     if token:
+        # Data plane: the customer's API key.
         req.add_header("Authorization", f"Bearer {token}")
+    elif CONTROL_TOKEN:
+        # Control plane: the user's login token.
+        req.add_header("Authorization", f"Bearer {CONTROL_TOKEN}")
+    else:
+        req.add_header("X-Dev-User", user)      # dev-auth only
     data = None
     if body is not None:
         data = json.dumps(body).encode()

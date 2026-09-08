@@ -6,3 +6,5 @@ redis==5.2.1
 pydantic==2.10.4
 pydantic-settings==2.7.0
 PyYAML==6.0.2
+PyJWT[crypto]==2.10.1
+

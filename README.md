@@ -4,43 +4,10 @@ The private backend tier of the LLMaaS platform: API keys, authentication,
 rate limiting, model routing and usage metering. See
 [architecture.md](architecture.md) for the overall design.
 
-```
-       ┌─────────────┐        ┌──────────────────────────┐        ┌──────────────┐
-User ──│ Frontend VM │────────│  Gateway / Broker VM     │────────│  GPU VM(s)   │
-  TLS  │ React + BFF │private │  broker + Postgres+Redis │private │  vLLM / Qwen │
-       └─────────────┘        └──────────────────────────┘        └──────────────┘
-         other repo                    THIS REPO                  configured here,
-                                                                  deployed there
-```
-
----
-
 ## Repository layout: two repos, not three
 
-**Decision: two repositories.** This one (gateway + serving config + infra),
+**Two repositories.** This one (gateway + serving config + infra),
 and a separate `llmaas-frontend`.
-
-**Why the GPU tier does *not* get its own repo.** It has no application code —
-vLLM is an off-the-shelf image, and the GPU VM's entire contents are a compose
-file and some flags. What it *does* have is a tight coupling to the gateway:
-adding a model means starting a vLLM process **and** adding a route to the
-broker's registry. Those two edits must land together or the platform is
-broken between merges. Splitting them across repos turns every model change
-into two coordinated PRs with no atomic rollback. So `serving/` lives here,
-next to the registry it must stay in sync with.
-
-**Why the frontend *does* get its own repo.** Different toolchain (Node/React
-vs Python), different release cadence, different CI. More importantly it is the
-only **publicly exposed** tier — keeping the private tier's code, config and
-issue tracker out of the public-facing repo is a real boundary, cheaply bought.
-
-**Why not one monorepo?** You could. The frontend/backend split is the useful
-seam because it matches the trust boundary; a further split by VM does not
-match any boundary that actually exists.
-
-If the GPU tier ever grows real code (custom schedulers, model lifecycle
-automation), `serving/` is a clean `git subtree split` away from becoming its
-own repo. Nothing here forecloses that.
 
 ---
 
@@ -53,7 +20,7 @@ own repo. Nothing here forecloses that.
 │   │   ├── main.py            app wiring + lifespan
 │   │   ├── config.py          env-driven settings
 │   │   ├── db.py / cache.py   Postgres pool, Redis client
-│   │   ├── security.py        key hashing, auth  ← THE AUTH GAP IS HERE
+│   │   ├── security.py        key hashing + API-key auth + user auth (JWT)
 │   │   ├── ratelimit.py       per-key request limits (Redis)
 │   │   ├── metering.py        usage rows for billing
 │   │   ├── registry.py        public model name → upstream
@@ -66,11 +33,19 @@ own repo. Nothing here forecloses that.
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── db/init.sql              users, api_keys, usage
-├── serving/                 GPU tier: vLLM compose + the model registry
+├── serving/                 GPU tier: vLLM compose + the model registries
+│   ├── models.mock.yaml       offline mock   (free, no network)
+│   ├── models.dev.yaml        Qwen via Hugging Face  (needs HF credits)
+│   ├── models.prod.yaml       your own vLLM on the GPU VM
+│   └── mock/server.py         the offline stand-in upstream
+├── tests/                   unit tests (30, all passing)
 ├── gateway/                 Envoy AI Gateway — empty until you need it
+├── docs/WORKFLOW.md         daily workflow, local setup, what NOT to install
 ├── docs/AUTH.md             what auth exists, what you must build
 ├── docs/THIRD_PARTY.md      accounts you need to create
-├── scripts/smoke.py         end-to-end test, stdlib only
+├── scripts/smoke.py         quick end-to-end test, stdlib only
+├── scripts/verify.py        deep verification: streaming, metering, isolation
+├── scripts/local_postgres.ps1   portable Postgres for Windows, no admin needed
 └── docker-compose.yml       the gateway VM stack
 ```
 
@@ -80,24 +55,51 @@ deleted when Envoy AI Gateway takes over). See [gateway/README.md](gateway/READM
 
 ---
 
-## Quick start (no GPU needed)
+## Day-to-day
 
-The dev config routes to **Qwen via Hugging Face's OpenAI-compatible router**,
-so the whole auth → rate limit → route → meter path works on a laptop.
+See **[docs/WORKFLOW.md](docs/WORKFLOW.md)** for the full workflow: venv, local
+Postgres without admin rights, troubleshooting, and why you should *not*
+install Envoy or Vault yet.
+
+## Quick start A — no Docker, no GPU, no network (works today)
+
+Runs the broker directly against portable Postgres and the offline mock
+upstream. The whole auth -> rate limit -> route -> stream -> meter path is
+real; only the model output is canned.
+
+```powershell
+py -3.12 -m venv .venv                       # once
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r broker\requirements-dev.txt
+Copy-Item .env.example .env                  # then set MODELS_FILE + AUTH_MODE
+.\scripts\local_postgres.ps1 setup           # once; no admin needed
+
+# terminal 1
+uvicorn server:app --app-dir serving\mock --port 8000
+# terminal 2
+uvicorn app.main:app --reload --app-dir broker --port 8080
+# terminal 3
+python scripts\smoke.py     # quick end-to-end
+python scripts\verify.py    # 29 deep checks
+pytest -q                   # 30 unit tests
+```
+
+## Quick start B — Docker (needs a working engine)
+
+The dev registry routes to **Qwen via Hugging Face's OpenAI-compatible
+router**, so you get real model output with no GPU.
 
 ```powershell
 Copy-Item .env.example .env
 # edit .env: set HF_TOKEN (see docs/THIRD_PARTY.md)
 docker compose up --build
+python scripts\smoke.py
 ```
 
-Then:
+> Docker does not currently work on the dev laptop (WSL2 backend missing, needs
+> admin). See [docs/WORKFLOW.md](docs/WORKFLOW.md#docker-on-this-laptop).
 
-```powershell
-python scripts/smoke.py
-```
-
-Or by hand:
+## By hand
 
 ```bash
 # 1. mint a key (plaintext is shown ONCE)
@@ -135,7 +137,7 @@ code where it belongs.
 
 | Missing | Where to add it | Priority |
 |---|---|---|
-| **User login on `/keys` and `/usage`** | `broker/app/security.py: require_user` | **blocking** — see [docs/AUTH.md](docs/AUTH.md) |
+| **A real `AUTH_MODE`** (login is implemented; the default is still `dev`) | `.env` — see [docs/AUTH.md](docs/AUTH.md) | **blocking before exposure** |
 | TLS between tiers | reverse proxy / vLLM flags | high |
 | Vault instead of `.env` | `broker/app/config.py`, commented service in compose | high |
 | Token-based rate limits | `broker/app/ratelimit.py` | high |
@@ -147,6 +149,9 @@ code where it belongs.
 
 ## Security properties already in place
 
+- Control-plane login verifies a signed JWT (`hs256` or `oidc`), with the
+  algorithm pinned, `exp` required, and `iss`/`aud` checked when configured.
+  Covered by [tests/test_auth.py](tests/test_auth.py).
 - API keys stored only as SHA-256; plaintext returned once, never persisted.
 - Customer keys are never forwarded upstream — the broker presents its own.
 - Revocation checked on every request; key deletion cascades to usage rows.

@@ -26,6 +26,7 @@ The router split in `broker/app/routers/` was designed for this:
 | `routers/keys.py`, `routers/usage.py` (control plane) | **stays** — the broker becomes a pure control plane |
 | `serving/models.prod.yaml` | becomes `AIServiceBackend` + `AIGatewayRoute` resources |
 | `app/security.py: require_key` | becomes an Envoy `BackendSecurityPolicy` / ext_authz call into the broker |
+| `app/security.py: require_user` | **stays** - control-plane login is not Envoy's job |
 | `app/ratelimit.py` | becomes Envoy's token rate limit, still backed by Redis |
 
 Drop the generated Envoy config (`AIGatewayRoute`, `AIServiceBackend`,

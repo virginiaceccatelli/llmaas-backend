@@ -1,6 +1,6 @@
 # DEV model registry — no GPU required.
 #
-# Routes our public model name to Hugging Face's OpenAI-compatible Inference
+# Routes our public model names to Hugging Face's OpenAI-compatible Inference
 # Providers router, so the whole auth/rate-limit/metering/billing path can be
 # exercised on a laptop before any GPU VM exists.
 #
@@ -10,21 +10,50 @@
 #      "Make calls to Inference Providers" permission.
 #   3. Put it in .env as HF_TOKEN=hf_xxx  (never commit it).
 #
-# Note: which exact Qwen checkpoints are servable through the HF router changes
-# over time. Check https://huggingface.co/models?inference_provider=all and
-# adjust `upstream_model` if a call returns "model not supported".
+# ---------------------------------------------------------------------------
+# HEADS UP: the HF free tier is a small MONTHLY CREDIT, not unlimited.
+# When it runs out every model returns:
+#   HTTP 402 "You have depleted your monthly included credits"
+# That is an account/billing state, NOT a bug in the broker. Options:
+#   - wait for the monthly reset,
+#   - buy pre-paid credits or HF PRO (a couple of dollars goes a long way),
+#   - or switch to the free offline mock:  serving/models.mock.yaml
+#     (set MODELS_FILE=./serving/models.mock.yaml)
+# ---------------------------------------------------------------------------
+#
+# The models below were VERIFIED live against the router (non-streaming and
+# streaming, with token usage correctly reported). Availability changes over
+# time — re-check at https://huggingface.co/models?inference_provider=all
 
 models:
+  # Default. Small, fast, cheap, and NOT a reasoning model, so it answers
+  # immediately instead of spending its token budget on hidden thinking.
   qwen-instruct:
     kind: openai                       # not vLLM -> do not send cache_salt
     base_url: https://router.huggingface.co/v1
-    upstream_model: Qwen/Qwen2.5-7B-Instruct
+    upstream_model: Qwen/Qwen3-4B-Instruct-2507
     api_key: ${HF_TOKEN}
 
-  # A second entry purely to prove multi-model routing works. Same upstream
-  # here; in prod each of these is a different vLLM process on a different GPU.
-  qwen-small:
+  # Second entry proves multi-model routing works. In production each of these
+  # is a separate vLLM process on its own GPU.
+  qwen-coder:
     kind: openai
     base_url: https://router.huggingface.co/v1
-    upstream_model: Qwen/Qwen2.5-1.5B-Instruct
+    upstream_model: Qwen/Qwen2.5-Coder-7B-Instruct
     api_key: ${HF_TOKEN}
+
+  # A REASONING model. Verified working, but note it emits `reasoning_content`
+  # and can burn 150+ completion tokens thinking before the visible answer.
+  # With a small max_tokens you get an EMPTY content field, which looks like a
+  # bug and is not one. Give it max_tokens >= 512, and expect higher bills.
+  qwen-thinking:
+    kind: openai
+    base_url: https://router.huggingface.co/v1
+    upstream_model: Qwen/Qwen3-32B
+    api_key: ${HF_TOKEN}
+
+# NOTE: Qwen/Qwen2.5-7B-Instruct (the model used in models.prod.yaml) is listed
+# by the router but returned an HTML 403 block page on this account — a
+# provider-side restriction, not something the broker can fix. It is still the
+# right choice for self-hosting on your own GPU, where the router is not
+# involved at all.

@@ -1,0 +1,25 @@
+# OFFLINE model registry — no GPU, no network, no HF credits.
+#
+# Point the broker here when the HF free tier is exhausted or you are offline:
+#   MODELS_FILE=./serving/models.mock.yaml
+#
+# Start the mock upstream first, in its own terminal:
+#   uvicorn server:app --app-dir serving/mock --port 8000
+#
+# Everything the broker does is real here — auth, rate limiting, routing,
+# streaming, token metering. Only the model output is canned.
+
+models:
+  qwen-instruct:
+    # "vllm" so the broker also sends cache_salt; the mock asserts it arrives,
+    # which is how you verify tenant cache isolation is actually wired up.
+    kind: vllm
+    base_url: http://127.0.0.1:8000/v1
+    upstream_model: mock-qwen-instruct
+    api_key: ""          # the mock needs no credential
+
+  qwen-coder:
+    kind: vllm
+    base_url: http://127.0.0.1:8000/v1
+    upstream_model: mock-qwen-coder
+    api_key: ""

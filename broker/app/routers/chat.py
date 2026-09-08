@@ -9,6 +9,8 @@ Request flow, end to end:
 This is the piece Envoy AI Gateway eventually replaces. Keeping it small and
 boring makes that swap cheap.
 """
+import logging
+
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
@@ -17,12 +19,20 @@ from .. import metering, ratelimit, registry, upstream
 from ..config import Settings, get_settings
 from ..security import require_key
 
+log = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/v1", tags=["inference"])
 
 
 @router.get("/models")
-async def list_models(key: asyncpg.Record = Depends(require_key)):
+async def list_models(
+    key: asyncpg.Record = Depends(require_key),
+    settings: Settings = Depends(get_settings),
+):
     """Advertise our public model names — never the upstream ids or URLs."""
+    # Rate limited too: it is served from memory, but require_key does a DB
+    # lookup, so an unlimited endpoint here is a database amplification vector.
+    await ratelimit.check(str(key["id"]), settings.rate_limit_per_min)
     return {
         "object": "list",
         "data": [
@@ -82,8 +92,15 @@ async def chat_completions(
     # --- non-streaming ---------------------------------------------------
     resp = await upstream.client().post(url, json=payload, headers=headers)
     if resp.status_code >= 400:
-        # Surface the upstream's error but not its identity/URL.
-        raise HTTPException(resp.status_code, f"upstream error: {resp.text[:500]}")
+        # Log the raw body for us; return a summary to the caller so we do not
+        # leak the upstream's identity or echo an entire HTML page back.
+        log.warning(
+            "upstream %s returned HTTP %s for model %s: %s",
+            route.base_url, resp.status_code, route.name, resp.text[:1000],
+        )
+        raise HTTPException(
+            resp.status_code, upstream.describe_error(resp.status_code, resp.text)
+        )
 
     data = resp.json()
     await metering.record(key["id"], route.name, data.get("usage"))

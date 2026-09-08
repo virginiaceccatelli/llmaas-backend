@@ -6,20 +6,24 @@ Two separate notions of identity live here — do not confuse them:
   2. User auth     (`require_user`) - a human managing their keys via /keys.
                                       This is a DEV STUB. See docs/AUTH.md.
 """
+import asyncio
 import hashlib
 import hmac
+import logging
 import secrets
+from functools import lru_cache
 
 import asyncpg
+import jwt
 from fastapi import Depends, Header, HTTPException, status
 
 from . import db
 from .config import Settings, get_settings
 
+log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# API key generation / hashing
-# ---------------------------------------------------------------------------
+AUTH_MODES = ("dev", "hs256", "oidc")
+
 def hash_key(raw_key: str) -> str:
     """API keys are 256 bits of CSPRNG output, so a plain SHA-256 is correct.
 
@@ -46,9 +50,6 @@ def tenant_cache_salt(user_id: str) -> str:
     return hashlib.sha256(f"tenant:{user_id}".encode()).hexdigest()[:32]
 
 
-# ---------------------------------------------------------------------------
-# 1. API-key authentication  (for /v1/* — the data plane)
-# ---------------------------------------------------------------------------
 async def require_key(
     authorization: str | None = Header(default=None),
     settings: Settings = Depends(get_settings),
@@ -82,33 +83,120 @@ async def require_key(
     return row
 
 
-# ---------------------------------------------------------------------------
-# 2. User authentication  (for /keys, /usage — the control plane)
-# ---------------------------------------------------------------------------
+def validate_auth_config(settings: Settings) -> None:
+    """Fail at startup, not on the first request, if auth is misconfigured."""
+    if settings.auth_mode not in AUTH_MODES:
+        raise ValueError(
+            f"AUTH_MODE must be one of {AUTH_MODES}, got {settings.auth_mode!r}"
+        )
+    if settings.auth_mode == "hs256" and not settings.auth_jwt_secret:
+        raise ValueError("AUTH_MODE=hs256 requires AUTH_JWT_SECRET to be set")
+    if settings.auth_mode == "oidc" and not settings.auth_oidc_jwks_url:
+        raise ValueError("AUTH_MODE=oidc requires AUTH_OIDC_JWKS_URL to be set")
+
+    if settings.auth_mode == "dev":
+        log.warning(
+            "AUTH_MODE=dev: /keys and /usage accept an unverified X-Dev-User "
+            "header. Anyone who can reach this port can mint an API key for "
+            "any user. Local development only."
+        )
+    elif not settings.auth_jwt_audience:
+        # Not fatal (an isolated broker with one issuer is still safe), but a
+        # token minted for a different service would otherwise be accepted.
+        log.warning(
+            "AUTH_JWT_AUDIENCE is unset: tokens are not checked for who they "
+            "were issued to. Set it in production."
+        )
+
+
+@lru_cache
+def _jwks_client(url: str) -> "jwt.PyJWKClient":
+    # Cached: the client keeps fetched signing keys in memory, so the IdP is
+    # hit once per key rotation rather than once per request.
+    return jwt.PyJWKClient(url, cache_keys=True)
+
+
+def _decode_options(settings: Settings) -> dict:
+    return {
+        "require": ["exp", "sub"],       # reject tokens that never expire
+        "verify_aud": bool(settings.auth_jwt_audience),
+        "verify_iss": bool(settings.auth_jwt_issuer),
+    }
+
+
+def _decode_kwargs(settings: Settings) -> dict:
+    kwargs = {"options": _decode_options(settings)}
+    if settings.auth_jwt_audience:
+        kwargs["audience"] = settings.auth_jwt_audience
+    if settings.auth_jwt_issuer:
+        kwargs["issuer"] = settings.auth_jwt_issuer
+    return kwargs
+
+
+def _verify_hs256(token: str, settings: Settings) -> dict:
+    # algorithms is pinned so a token claiming alg:none or alg:RS256 cannot
+    # bypass the shared secret (the classic JWT algorithm-confusion attack).
+    return jwt.decode(
+        token, settings.auth_jwt_secret, algorithms=["HS256"], **_decode_kwargs(settings)
+    )
+
+
+async def _verify_oidc(token: str, settings: Settings) -> dict:
+    client = _jwks_client(settings.auth_oidc_jwks_url)
+    # PyJWKClient does blocking HTTP on a cache miss; keep it off the event loop.
+    signing_key = await asyncio.to_thread(client.get_signing_key_from_jwt, token)
+    return jwt.decode(
+        token,
+        signing_key.key,
+        algorithms=["RS256", "ES256"],
+        **_decode_kwargs(settings),
+    )
+
+
 async def require_user(
+    authorization: str | None = Header(default=None),
     x_dev_user: str | None = Header(default=None),
     settings: Settings = Depends(get_settings),
 ) -> str:
-    """>>> THIS IS THE MAIN PLACE YOU MUST ADD REAL AUTHENTICATION. <<<
+    """Identify the human managing API keys. Returns a trusted user id.
 
-    Right now it trusts an `X-Dev-User` header, i.e. anyone who can reach the
-    broker can mint API keys for any user. That is only acceptable because the
-    broker is on a private network and the frontend VM is the only caller.
-
-    Replace the body with ONE of:
-      (a) Validate a session cookie / JWT issued by the frontend BFF, or
-      (b) Validate an OIDC access token from Authentik / Auth.js / Keycloak
-          (verify signature against the IdP's JWKS, check `aud`, `exp`, `iss`,
-          then return the `sub` claim as the user id).
-
-    Whichever you choose, this function must return a user id that the caller
-    has actually proven they own. Everything downstream trusts it.
-    See docs/AUTH.md.
+    Everything downstream trusts this value, so it must never be caller-
+    supplied except in "dev" mode. See docs/AUTH.md for how to issue tokens.
     """
-    if not settings.dev_auth_enabled:
+    if settings.auth_mode == "dev":
+        return x_dev_user or settings.dev_user_id
+
+    if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(
-            status.HTTP_501_NOT_IMPLEMENTED,
-            "dev auth is disabled and no real authentication is configured; "
-            "implement require_user() in broker/app/security.py",
+            status.HTTP_401_UNAUTHORIZED,
+            "missing bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-    return x_dev_user or settings.dev_user_id
+    token = authorization[7:].strip()
+
+    try:
+        if settings.auth_mode == "hs256":
+            claims = _verify_hs256(token, settings)
+        else:
+            claims = await _verify_oidc(token, settings)
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "token expired")
+    except jwt.InvalidTokenError as exc:
+        # Covers bad signature, wrong audience/issuer, missing claims, and
+        # unexpected algorithms. Deliberately vague to the caller, logged here.
+        log.info("rejected control-plane token: %s", exc)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid token")
+    except Exception as exc:  # noqa: BLE001 - e.g. IdP unreachable
+        log.exception("auth backend error")
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "authentication unavailable"
+        ) from exc
+
+    sub = claims.get("sub")
+    if not sub or not isinstance(sub, str):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "token has no subject")
+    return sub
+
+# EXTEND: authorisation, as opposed to authentication. Once tokens carry roles
+# or groups, add a `require_admin` dependency for operator-only endpoints, and
+# check plan/entitlement claims before allowing key creation.

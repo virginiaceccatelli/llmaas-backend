@@ -9,6 +9,12 @@
   *"Make calls to Inference Providers"* permission.
 - Put it in `.env` as `HF_TOKEN=hf_...`.
 
+**The free tier is a small monthly credit, not unlimited.** Once it is spent,
+every model returns `HTTP 402 "You have depleted your monthly included
+credits"` — an account state, not a broker bug. Either wait for the monthly
+reset, buy a few dollars of pre-paid credits, or switch the broker to the free
+offline mock (`MODELS_FILE=./serving/models.mock.yaml`).
+
 Used for **two different things** — don't confuse them:
 
 | Where | Why | Cost |

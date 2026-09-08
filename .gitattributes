@@ -1,0 +1,12 @@
+# Keep line endings stable: this repo is edited on Windows but runs on Linux
+# VMs and inside containers. Without this, a CRLF shell script or SQL file
+# silently breaks on the gateway VM.
+* text=auto eol=lf
+
+# PowerShell is the exception - it is only ever run on Windows.
+*.ps1 text eol=crlf
+
+# Never touch binaries.
+*.png binary
+*.jpg binary
+*.zip binary

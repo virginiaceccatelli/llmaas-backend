@@ -47,5 +47,12 @@ gating, strong multilingual instruct performance, and well-supported by vLLM.
 - Newer Qwen generations work the same way — change `--model` and the
   `upstream_model` in `models.prod.yaml`, nothing else.
 
+> **Self-hosting and the dev registry are different worlds.** Any model on the
+> Hub can be self-hosted here, because vLLM downloads the weights. The HF
+> router used by `models.dev.yaml` serves only a subset — `Qwen2.5-1.5B-Instruct`
+> for instance is downloadable but *not* routable, and `Qwen2.5-7B-Instruct`
+> was refused by the providers enabled on our account. Neither fact affects
+> self-hosting.
+
 Weights download from Hugging Face on first start. Open models need no token;
 set `HF_TOKEN` only if you later use a gated repo.

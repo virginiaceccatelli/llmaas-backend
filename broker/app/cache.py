@@ -1,7 +1,4 @@
 """Redis connection. Used for fast rate-limit counters only.
-
-Nothing here is a source of truth: if Redis is wiped, users just get a fresh
-rate-limit window. Never store keys or usage records here.
 """
 import redis.asyncio as redis
 

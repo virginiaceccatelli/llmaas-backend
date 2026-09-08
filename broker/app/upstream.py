@@ -70,6 +70,36 @@ def build_headers(route: ModelRoute) -> dict[str, str]:
     return headers
 
 
+def describe_error(status_code: int, body: str) -> str:
+    """Turn an upstream failure into something a customer can act on.
+
+    Upstreams sometimes answer with an HTML block page (Cloudflare, a provider
+    denying the model, an unauthenticated request bouncing to a login page).
+    Dumping that into a JSON error field is useless to the caller and leaks
+    which backend we use, so summarise it instead. Full body is logged.
+    """
+    stripped = body.lstrip()
+    if stripped.startswith("<") or "<html" in stripped[:200].lower():
+        if status_code in (401, 403):
+            return (
+                "upstream rejected our credentials — the broker's API key for "
+                "this model is missing, expired, or not permitted"
+            )
+        return f"upstream returned an error page (HTTP {status_code})"
+
+    try:
+        doc = json.loads(body)
+    except json.JSONDecodeError:
+        return f"upstream error (HTTP {status_code}): {body[:200]}"
+
+    err = doc.get("error") if isinstance(doc, dict) else None
+    if isinstance(err, dict) and err.get("message"):
+        return f"upstream error: {err['message'][:300]}"
+    if isinstance(err, str):
+        return f"upstream error: {err[:300]}"
+    return f"upstream error (HTTP {status_code})"
+
+
 def extract_usage_from_sse(chunk_text: str, sink: dict) -> None:
     """Scan streamed SSE lines for the final `usage` object and stash it.
 

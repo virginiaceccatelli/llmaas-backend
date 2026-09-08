@@ -6,7 +6,7 @@ them separate is the single most important thing to get right.
 | | Who authenticates | Against what | Status |
 |---|---|---|---|
 | **Data plane** | a program (SDK, curl, someone's script) | an **API key** | ✅ implemented |
-| **Control plane** | a human in a browser | a **login session** | ❌ **stub — you must build this** |
+| **Control plane** | a human in a browser | a **login token** | ✅ implemented (needs configuring) |
 
 ---
 
@@ -35,17 +35,27 @@ Gaps worth closing before real customers, in priority order:
 
 ---
 
-## 2. Control plane — user login (THIS IS THE GAP)
+## 2. Control plane — user login
 
 `POST /keys`, `GET /keys`, `DELETE /keys/{id}`, `GET /usage`.
 
-**Right now these are unauthenticated.** `require_user` in
-[`broker/app/security.py`](../broker/app/security.py) returns whatever is in
-the `X-Dev-User` header, or `demo-user`. Anyone who can reach port 8080 can
-mint an API key for any user id.
+Implemented in [`broker/app/security.py`](../broker/app/security.py) →
+`require_user`, with three modes selected by `AUTH_MODE`:
 
-That is survivable *only* because the broker sits on a private network. The
-broker logs a warning on every startup while `DEV_AUTH_ENABLED=true`.
+| `AUTH_MODE` | What it does | Use when |
+|---|---|---|
+| `dev` *(default)* | Trusts an unverified `X-Dev-User` header | Your laptop, only |
+| `hs256` | Verifies a JWT signed by the frontend BFF with a shared secret | You have a BFF but no IdP |
+| `oidc` | Verifies a JWT against an identity provider's JWKS | **Production** |
+
+Misconfiguration is caught **at startup**, not on the first request: `hs256`
+without `AUTH_JWT_SECRET` and `oidc` without `AUTH_OIDC_JWKS_URL` both refuse
+to boot. `dev` mode logs a loud warning on every start.
+
+What the JWT modes check: the signature with the algorithm **pinned** (so
+`alg:none` and algorithm-confusion attacks fail), `exp` (tokens *must* carry
+one), `sub` (must be present), plus `iss` and `aud` when configured. All of
+this is covered by [`tests/test_auth.py`](../tests/test_auth.py).
 
 ### Where the login actually belongs
 
@@ -55,45 +65,70 @@ calls the broker server-to-server. The broker only needs to answer "which user
 is this request for?".
 
 ```
-browser --(session cookie, TLS)--> frontend BFF --(private net)--> broker
-         ^^^ auth happens here                     ^^^ trusts the BFF
+browser --(session cookie, TLS)--> frontend BFF --(JWT, private net)--> broker
+         ^^^ login happens here                   ^^^ verifies signature
 ```
 
-### Pick one of two options
+Note the broker no longer *trusts* the BFF — it verifies a signature. Network
+segmentation is one layer, not the whole answer.
 
-**Option A — sessions in the frontend BFF (simplest, no third party).**
+### Option A — sessions in the BFF (`AUTH_MODE=hs256`)
 
-- FastAPI BFF issues a signed, `HttpOnly`, `Secure`, `SameSite=Lax` session
-  cookie on login. Store password hashes with `argon2` (here you *do* want a
-  slow hash — passwords are low entropy, unlike API keys).
-- The BFF then calls the broker with the resolved user id.
-- Change `require_user` to verify a short-lived **service token** (a shared
-  HMAC/JWT between BFF and broker) and read the user id from its claims.
-  Do **not** just keep trusting an unsigned header — network segmentation is
-  one layer, not the whole answer.
-- You own password reset, email verification, MFA, and lockout. That is real
-  work; do not underestimate it.
+No third party. The BFF issues an `HttpOnly`, `Secure`, `SameSite=Lax` session
+cookie on login, then mints a short-lived JWT for each call to the broker:
 
-**Option B — an identity provider (recommended).**
+```python
+# in the frontend BFF
+import jwt, datetime as dt
+now = dt.datetime.now(dt.timezone.utc)
+token = jwt.encode({
+    "sub": user_id,                       # who the broker will bill
+    "iss": "llmaas-frontend",
+    "aud": "llmaas-broker",
+    "iat": now,
+    "exp": now + dt.timedelta(minutes=5), # keep it short
+}, AUTH_JWT_SECRET, algorithm="HS256")
+```
 
-Use **Authentik** (self-hosted, no vendor, matches "keep it on our OpenStack")
-or **Auth.js/Keycloak**. Then:
+Set the same `AUTH_JWT_SECRET`, `AUTH_JWT_ISSUER` and `AUTH_JWT_AUDIENCE` in
+the broker's `.env`. You can test this before the frontend exists:
 
-- the frontend does the OIDC redirect dance and receives an access token;
-- the BFF passes that token to the broker;
-- `require_user` becomes: fetch the IdP's JWKS (cache it), verify the
-  signature, check `iss`, `aud`, `exp`, `nbf`, then `return claims["sub"]`.
+```powershell
+$env:LLMAAS_CONTROL_TOKEN = (python scripts\make_token.py --user alice)
+python scripts\smoke.py
+```
 
-That's roughly 30 lines with `pyjwt[crypto]`. You get MFA, SSO, password reset
-and account lockout for free, which is why this is the recommendation.
+You still own password reset, email verification, MFA and lockout. That is
+real work — do not underestimate it. Store password hashes with **argon2**
+(here you *do* want a slow hash: passwords are low-entropy, unlike API keys).
 
-### Concretely, to close the gap
+### Option B — an identity provider (`AUTH_MODE=oidc`, recommended)
 
-1. Implement the body of `require_user` (option A or B).
-2. Set `DEV_AUTH_ENABLED=false` in `.env`. With no implementation in place the
-   endpoints then return `501` rather than silently trusting a header — a
-   deliberate fail-closed.
-3. Add a test that `POST /keys` without credentials returns `401`.
+Use **Authentik** (self-hosted, no vendor, stays on your OpenStack) or
+Keycloak/Auth.js. The frontend does the OIDC redirect dance, the BFF forwards
+the resulting access token, and the broker verifies it against the IdP's
+published keys:
+
+```ini
+AUTH_MODE=oidc
+AUTH_OIDC_JWKS_URL=https://auth.example.org/application/o/llmaas/jwks/
+AUTH_JWT_ISSUER=https://auth.example.org/application/o/llmaas/
+AUTH_JWT_AUDIENCE=llmaas-broker
+```
+
+MFA, SSO, password reset and account lockout all come for free, which is why
+this is the recommendation.
+
+### Before going live
+
+1. Set `AUTH_MODE` to `hs256` or `oidc` — **never leave it as `dev`**.
+2. Set `AUTH_JWT_AUDIENCE` and `AUTH_JWT_ISSUER`. Without an audience check a
+   token minted for a different service would be accepted here. The broker
+   warns about this at startup.
+3. Keep token lifetimes short (5–15 min). The broker rejects tokens that carry
+   no `exp` at all.
+4. Serve the broker over TLS. A bearer token on a plaintext link is a password
+   in cleartext.
 
 ---
 

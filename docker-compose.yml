@@ -45,6 +45,9 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-llmaas}:${POSTGRES_PASSWORD:-llmaas}@postgres:5432/${POSTGRES_DB:-llmaas}
       REDIS_URL: redis://redis:6379/0
       MODELS_FILE: /srv/models.yaml
+      # Pinned here so an uncommented "memory" line in .env (used for running
+      # the broker directly on a laptop) can never weaken the container.
+      RATE_LIMIT_BACKEND: redis
     volumes:
       # DEV: Hugging Face upstream, no GPU needed.
       # PROD: swap to ./serving/models.prod.yaml to hit the real vLLM VM.

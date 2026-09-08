@@ -19,13 +19,27 @@ import yaml
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
-def _expand_env(text: str) -> str:
-    """Replace ${VAR} with the environment value, or "" if unset.
+def _expand_env(text: str) -> tuple[str, set[str]]:
+    """Replace ${VAR} with its environment value.
+
+    Returns the expanded text plus the names of any referenced variables that
+    were not set, so the caller can refuse to start rather than silently
+    running with an empty credential.
 
     Hand-rolled rather than os.path.expandvars, which is path-oriented and
     behaves differently on Windows and POSIX.
     """
-    return _ENV_REF.sub(lambda m: os.environ.get(m.group(1), ""), text)
+    missing: set[str] = set()
+
+    def sub(m: re.Match) -> str:
+        name = m.group(1)
+        value = os.environ.get(name)
+        if value is None or value == "":
+            missing.add(name)
+            return ""
+        return value
+
+    return _ENV_REF.sub(sub, text), missing
 
 
 @dataclass(frozen=True)
@@ -43,10 +57,25 @@ class Registry:
 
     @classmethod
     def from_file(cls, path: str) -> "Registry":
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"model registry not found at {path!r}. Inside Docker this is "
+                f"mounted at /srv/models.yaml; running the broker directly, set "
+                f"MODELS_FILE=./serving/models.dev.yaml in your .env "
+                f"(see docs/WORKFLOW.md)."
+            )
         with open(path, "r", encoding="utf-8") as fh:
             # ${VAR} in the YAML is filled from the environment, so secrets
             # (upstream API keys) never live in the config file itself.
-            raw = _expand_env(fh.read())
+            raw, missing = _expand_env(fh.read())
+        if missing:
+            # Without this the broker starts happily, then sends unauthenticated
+            # requests upstream and gets back an HTML error page. Fail here.
+            raise ValueError(
+                f"{path} references environment variables that are unset or "
+                f"empty: {', '.join(sorted(missing))}. Set them in .env "
+                f"(see .env.example)."
+            )
         doc = yaml.safe_load(raw) or {}
 
         routes: dict[str, ModelRoute] = {}
