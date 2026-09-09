@@ -1,10 +1,8 @@
 """
 Two separate notions of identity live here — do not confuse them:
 
-  1. API-key auth  (`require_key`)  - machine callers hitting /v1/*.
-                                      This is production-shaped already.
-  2. User auth     (`require_user`) - a human managing their keys via /keys.
-                                      This is a DEV STUB. See docs/AUTH.md.
+  1. API-key auth  (`require_key`)  - machine callers hitting /v1/*
+  2. User auth     (`require_user`) - a human managing their keys via /keys (DEV ONLY)
 """
 import asyncio
 import hashlib
@@ -25,11 +23,6 @@ log = logging.getLogger(__name__)
 AUTH_MODES = ("dev", "hs256", "oidc")
 
 def hash_key(raw_key: str) -> str:
-    """API keys are 256 bits of CSPRNG output, so a plain SHA-256 is correct.
-
-    bcrypt/argon2 exist to slow down guessing of *low-entropy* human passwords;
-    they buy nothing here and would add ~100ms to every single request.
-    """
     return hashlib.sha256(raw_key.encode()).hexdigest()
 
 
@@ -41,12 +34,7 @@ def new_key(prefix: str) -> tuple[str, str]:
 
 
 def tenant_cache_salt(user_id: str) -> str:
-    """Per-tenant salt for vLLM's prefix/KV cache.
-
-    Without this, two tenants sending the same prompt prefix share cache
-    entries, and the resulting timing difference leaks whether another tenant
-    has sent a given prefix. Salting scopes the cache per tenant.
-    """
+    # Per-tenant salt for vLLM's prefix/KV cache.
     return hashlib.sha256(f"tenant:{user_id}".encode()).hexdigest()[:32]
 
 
@@ -62,7 +50,7 @@ async def require_key(
         )
     raw_key = authorization[7:].strip()
 
-    # Lookup is by hash, so a database dump never yields usable keys.
+    # Lookup is by hash, so a database dump never yields usable keys
     async with db.pool().acquire() as conn:
         row = await conn.fetchrow(
             """SELECT id, user_id, revoked, key_hash
@@ -73,8 +61,6 @@ async def require_key(
     if row is None or row["revoked"]:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or revoked key")
 
-    # Belt-and-braces constant-time confirm (the index lookup above already
-    # decided the match; this just keeps the comparison itself timing-safe).
     if not hmac.compare_digest(row["key_hash"], hash_key(raw_key)):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid key")
 
@@ -84,7 +70,6 @@ async def require_key(
 
 
 def validate_auth_config(settings: Settings) -> None:
-    """Fail at startup, not on the first request, if auth is misconfigured."""
     if settings.auth_mode not in AUTH_MODES:
         raise ValueError(
             f"AUTH_MODE must be one of {AUTH_MODES}, got {settings.auth_mode!r}"
@@ -101,8 +86,6 @@ def validate_auth_config(settings: Settings) -> None:
             "any user. Local development only."
         )
     elif not settings.auth_jwt_audience:
-        # Not fatal (an isolated broker with one issuer is still safe), but a
-        # token minted for a different service would otherwise be accepted.
         log.warning(
             "AUTH_JWT_AUDIENCE is unset: tokens are not checked for who they "
             "were issued to. Set it in production."
@@ -111,8 +94,6 @@ def validate_auth_config(settings: Settings) -> None:
 
 @lru_cache
 def _jwks_client(url: str) -> "jwt.PyJWKClient":
-    # Cached: the client keeps fetched signing keys in memory, so the IdP is
-    # hit once per key rotation rather than once per request.
     return jwt.PyJWKClient(url, cache_keys=True)
 
 
@@ -134,8 +115,6 @@ def _decode_kwargs(settings: Settings) -> dict:
 
 
 def _verify_hs256(token: str, settings: Settings) -> dict:
-    # algorithms is pinned so a token claiming alg:none or alg:RS256 cannot
-    # bypass the shared secret (the classic JWT algorithm-confusion attack).
     return jwt.decode(
         token, settings.auth_jwt_secret, algorithms=["HS256"], **_decode_kwargs(settings)
     )
@@ -143,7 +122,6 @@ def _verify_hs256(token: str, settings: Settings) -> dict:
 
 async def _verify_oidc(token: str, settings: Settings) -> dict:
     client = _jwks_client(settings.auth_oidc_jwks_url)
-    # PyJWKClient does blocking HTTP on a cache miss; keep it off the event loop.
     signing_key = await asyncio.to_thread(client.get_signing_key_from_jwt, token)
     return jwt.decode(
         token,
@@ -158,11 +136,6 @@ async def require_user(
     x_dev_user: str | None = Header(default=None),
     settings: Settings = Depends(get_settings),
 ) -> str:
-    """Identify the human managing API keys. Returns a trusted user id.
-
-    Everything downstream trusts this value, so it must never be caller-
-    supplied except in "dev" mode. See docs/AUTH.md for how to issue tokens.
-    """
     if settings.auth_mode == "dev":
         return x_dev_user or settings.dev_user_id
 
@@ -182,8 +155,6 @@ async def require_user(
     except jwt.ExpiredSignatureError:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "token expired")
     except jwt.InvalidTokenError as exc:
-        # Covers bad signature, wrong audience/issuer, missing claims, and
-        # unexpected algorithms. Deliberately vague to the caller, logged here.
         log.info("rejected control-plane token: %s", exc)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid token")
     except Exception as exc:  # noqa: BLE001 - e.g. IdP unreachable

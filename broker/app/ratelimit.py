@@ -1,9 +1,5 @@
 """
 Fixed-window request rate limiting: one counter per key per minute.
-
-Deliberately the simplest thing that works. Its known weakness is burstiness at
-the window boundary (up to 2x the limit across two adjacent windows).
-
 Two backends:
   "redis"  - correct. Counters are shared, so the limit holds across every
              broker process. This is the only valid choice in production.

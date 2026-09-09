@@ -1,4 +1,4 @@
-"""Postgres connection pool. Holds API keys and usage records."""
+# Postgres connection holds API keys and usage records
 import asyncpg
 
 _pool: asyncpg.Pool | None = None

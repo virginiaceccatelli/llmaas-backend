@@ -1,10 +1,6 @@
 """
-End-to-end smoke test. Stdlib only — no pip install needed.
-
     python scripts/smoke.py
-
-Walks the whole flow: mint a key -> list keys -> call the model with that key
--> check usage was recorded -> revoke the key -> confirm it now fails.
+    key -> list keys -> call the model with that key -> check usage was recorded -> revoke the key -> confirm it now fails
 """
 import json
 import os

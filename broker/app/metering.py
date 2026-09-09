@@ -1,9 +1,3 @@
-"""
-Usage accounting: one row per request, aggregated later for billing.
-
-Writes are best-effort and must never fail the user's request — a dropped
-usage row costs money, a 500 on a successful completion costs a customer.
-"""
 import logging
 import uuid
 

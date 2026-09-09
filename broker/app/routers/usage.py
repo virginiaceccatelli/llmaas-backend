@@ -1,4 +1,3 @@
-"""Usage reporting for the account page. Control plane, so `require_user`."""
 from fastapi import APIRouter, Depends
 
 from .. import db

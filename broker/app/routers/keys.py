@@ -1,9 +1,8 @@
 """
-API key management — the control plane. This is what the frontend's account
-page calls.
+API key management: the control plane. 
 
->>> AUTHENTICATION GAP: every endpoint here depends on `require_user`, which
->>> is currently a dev stub. See broker/app/security.py and docs/AUTH.md.
+AUTHENTICATION GAP: every endpoint here depends on `require_user`, which
+is currently a dev stub. See broker/app/security.py and docs/AUTH.md.
 """
 import uuid
 

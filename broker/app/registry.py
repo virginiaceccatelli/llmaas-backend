@@ -1,8 +1,6 @@
 """
-Model registry: the routing table of the whole platform.
-
-A public model name (what the customer puts in `"model": ...`) maps to:
-  - a base URL   -> which vLLM instance / GPU VM serves it
+Model registry: 
+  - model name -> base URL -> which vLLM instance / GPU VM serves it
   - an upstream model id -> what that backend actually calls it
   - an optional API key  -> credential the broker uses to talk to that backend
   - a kind ("vllm" | "openai") -> enables vLLM-only features like cache_salt
@@ -20,15 +18,8 @@ _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def _expand_env(text: str) -> tuple[str, set[str]]:
-    """Replace ${VAR} with its environment value.
-
-    Returns the expanded text plus the names of any referenced variables that
-    were not set, so the caller can refuse to start rather than silently
-    running with an empty credential.
-
-    Hand-rolled rather than os.path.expandvars, which is path-oriented and
-    behaves differently on Windows and POSIX.
-    """
+    # Replace ${VAR} with its environment value.
+    
     missing: set[str] = set()
 
     def sub(m: re.Match) -> str:
@@ -66,11 +57,9 @@ class Registry:
             )
         with open(path, "r", encoding="utf-8") as fh:
             # ${VAR} in the YAML is filled from the environment, so secrets
-            # (upstream API keys) never live in the config file itself.
+            # (upstream API keys) never live in the config file itself
             raw, missing = _expand_env(fh.read())
         if missing:
-            # Without this the broker starts happily, then sends unauthenticated
-            # requests upstream and gets back an HTML error page. Fail here.
             raise ValueError(
                 f"{path} references environment variables that are unset or "
                 f"empty: {', '.join(sorted(missing))}. Set them in .env "
@@ -81,8 +70,6 @@ class Registry:
         routes: dict[str, ModelRoute] = {}
         for name, spec in (doc.get("models") or {}).items():
             base_url = (spec.get("base_url") or "").strip()
-            # Catch a ${VAR} that expanded to nothing — otherwise the broker
-            # starts happily and every request fails with a confusing error.
             if not re.match(r"^https?://[^/:\s]+", base_url):
                 raise ValueError(
                     f"model {name!r}: base_url is {base_url!r} — is an "

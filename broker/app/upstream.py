@@ -1,10 +1,3 @@
-"""
-Talking to the GPU tier.
-
-One shared httpx client for the whole process (connection pooling matters a lot
-when every request is a long-lived streamed completion), plus the logic that
-rewrites a customer request into an upstream request.
-"""
 import json
 from typing import Any, AsyncIterator
 
@@ -38,20 +31,16 @@ def client() -> httpx.AsyncClient:
 
 
 def build_payload(route: ModelRoute, body: dict[str, Any], user_id: str) -> dict[str, Any]:
-    """Rewrite the customer's request body into what the upstream expects."""
     payload = dict(body)
 
     # The customer uses our public name; the upstream uses its own model id.
     payload["model"] = route.upstream_model
 
     if route.kind == "vllm":
-        # Tenant isolation of the prefix/KV cache (see security.tenant_cache_salt).
-        # This is a vLLM extension field, so only send it to vLLM upstreams.
+        # Tenant isolation of the prefix/KV cache (see security.tenant_cache_salt) - vLLM
         payload["cache_salt"] = tenant_cache_salt(user_id)
 
     if payload.get("stream"):
-        # Ask the upstream to append a final chunk containing token usage,
-        # otherwise streamed requests would be unbillable.
         opts = dict(payload.get("stream_options") or {})
         opts["include_usage"] = True
         payload["stream_options"] = opts
@@ -63,7 +52,6 @@ def build_payload(route: ModelRoute, body: dict[str, Any], user_id: str) -> dict
 
 
 def build_headers(route: ModelRoute) -> dict[str, str]:
-    """The customer's key NEVER goes upstream. We present our own credential."""
     headers = {"Content-Type": "application/json"}
     if route.api_key:
         headers["Authorization"] = f"Bearer {route.api_key}"
@@ -71,13 +59,6 @@ def build_headers(route: ModelRoute) -> dict[str, str]:
 
 
 def describe_error(status_code: int, body: str) -> str:
-    """Turn an upstream failure into something a customer can act on.
-
-    Upstreams sometimes answer with an HTML block page (Cloudflare, a provider
-    denying the model, an unauthenticated request bouncing to a login page).
-    Dumping that into a JSON error field is useless to the caller and leaks
-    which backend we use, so summarise it instead. Full body is logged.
-    """
     stripped = body.lstrip()
     if stripped.startswith("<") or "<html" in stripped[:200].lower():
         if status_code in (401, 403):
@@ -101,12 +82,6 @@ def describe_error(status_code: int, body: str) -> str:
 
 
 def extract_usage_from_sse(chunk_text: str, sink: dict) -> None:
-    """Scan streamed SSE lines for the final `usage` object and stash it.
-
-    OpenAI-compatible servers send usage in the last data frame when
-    stream_options.include_usage is set. We parse it out purely so metering
-    works; the bytes themselves are passed through to the client untouched.
-    """
     for line in chunk_text.splitlines():
         line = line.strip()
         if not line.startswith("data:"):

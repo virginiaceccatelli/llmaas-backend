@@ -1,13 +1,6 @@
 """
-Mint a control-plane JWT for testing AUTH_MODE=hs256.
-
-In production the frontend BFF does this after a user logs in — this script
-exists so you can test the broker before the frontend exists.
-
     python scripts/make_token.py --user alice@example.com
-    python scripts/make_token.py --user alice --expires-in 30    # seconds
-
-Then:
+    python scripts/make_token.py --user alice --expires-in 30   
     curl -H "Authorization: Bearer <token>" localhost:8080/keys
 """
 import argparse
@@ -60,8 +53,6 @@ def main() -> int:
         "iat": now,
         "exp": now + dt.timedelta(seconds=args.expires_in),
     }
-    # Only include these if configured — the broker verifies them only when
-    # its own AUTH_JWT_ISSUER / AUTH_JWT_AUDIENCE are set.
     if args.issuer:
         claims["iss"] = args.issuer
     if args.audience:

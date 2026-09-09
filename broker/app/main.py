@@ -1,17 +1,12 @@
 """
-LLMaaS broker — the application that runs on the Gateway/Broker VM.
-
-Responsibilities today:
+LLMaaS broker
   - issue and revoke API keys (hash-at-rest, shown once)
   - authenticate inference requests by key
   - rate limit per key
   - route each public model name to the right vLLM instance
   - record token usage for billing
 
-Responsibilities later: Envoy AI Gateway takes over auth + routing + rate
-limiting on the data plane, and this service shrinks to the control plane
-(key management, usage, billing). The split is already reflected in the
-router layout: routers/chat.py is the part that goes away.
+Later: Envoy AI Gateway can do all of auth + routing + rate limiting on the data plane, this will run the control plane (key management, usage, billing)
 """
 import logging
 from contextlib import asynccontextmanager
@@ -32,14 +27,13 @@ log = logging.getLogger("broker")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Must run before the registry is loaded: it expands ${VAR} from os.environ.
     loaded = config.load_env_file()
     if loaded:
         log.info("loaded %d settings from .env: %s", len(loaded), ", ".join(loaded))
 
     settings = get_settings()
 
-    # Config problems must stop the process here, not surface as 500s later.
+    # Config problems must stop the process here
     security.validate_auth_config(settings)
     registry.load(settings.models_file)
     await db.connect(settings.database_url)

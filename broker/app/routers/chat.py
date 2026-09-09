@@ -1,13 +1,9 @@
 """
-The data plane: OpenAI-compatible inference endpoints.
-
-Request flow, end to end:
     client key -> authenticate -> rate limit -> resolve model to an upstream
                -> rewrite body (upstream model id + tenant cache salt)
                -> proxy to vLLM -> record usage
 
-This is the piece Envoy AI Gateway eventually replaces. Keeping it small and
-boring makes that swap cheap.
+Eventually replaced by Envoy AI Gateway.
 """
 import logging
 
@@ -29,9 +25,6 @@ async def list_models(
     key: asyncpg.Record = Depends(require_key),
     settings: Settings = Depends(get_settings),
 ):
-    """Advertise our public model names — never the upstream ids or URLs."""
-    # Rate limited too: it is served from memory, but require_key does a DB
-    # lookup, so an unlimited endpoint here is a database amplification vector.
     await ratelimit.check(str(key["id"]), settings.rate_limit_per_min)
     return {
         "object": "list",
@@ -70,7 +63,6 @@ async def chat_completions(
     headers = upstream.build_headers(route)
     url = f"{route.base_url}/chat/completions"
 
-    # --- streaming -------------------------------------------------------
     if body.get("stream"):
         usage_sink: dict = {}
 
@@ -89,7 +81,6 @@ async def chat_completions(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    # --- non-streaming ---------------------------------------------------
     resp = await upstream.client().post(url, json=payload, headers=headers)
     if resp.status_code >= 400:
         # Log the raw body for us; return a summary to the caller so we do not

@@ -1,16 +1,7 @@
 """
-Deep verification of a running broker. Stdlib only — no pip install needed.
-
     python scripts/verify.py                         # defaults to :8080
     python scripts/verify.py http://127.0.0.1:8091
-
-Goes well beyond scripts/smoke.py: streaming, metering accuracy, multi-model
-routing, rate limiting, tenant isolation, and the error paths. Each check
-prints PASS / FAIL / SKIP with a reason, and the exit code is non-zero if
-anything failed.
-
-Checks that need multiple users are skipped when AUTH_MODE is not "dev",
-because a single login token only proves one identity.
+    deeper smoke test: streaming, metering accuracy, multi-model routing, rate limiting, tenant isolation, and the error paths. 
 """
 import json
 import os
@@ -22,7 +13,6 @@ import uuid
 
 BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8080").rstrip("/")
 CONTROL_TOKEN = os.environ.get("LLMAAS_CONTROL_TOKEN", "")
-# The mock upstream exposes /debug/last so we can assert what the broker sent.
 MOCK_URL = os.environ.get("MOCK_URL", "http://127.0.0.1:8000").rstrip("/")
 
 results: list[tuple[str, str, str]] = []
@@ -87,7 +77,6 @@ def usage_for(user):
 def main() -> int:
     print(f"\nVerifying {BASE}\n")
 
-    # ---------------------------------------------------------------- infra
     print("Infrastructure")
     st, body = call("GET", "/ready")
     checks = body.get("checks", {}) if isinstance(body, dict) else {}
@@ -103,7 +92,6 @@ def main() -> int:
     else:
         record("auth mode", st == 200, "dev (X-Dev-User trusted)")
 
-    # ------------------------------------------------------------ key mgmt
     print("\nAPI keys")
     alice = f"verify-alice-{uuid.uuid4().hex[:8]}"
     bob = f"verify-bob-{uuid.uuid4().hex[:8]}"
@@ -122,7 +110,6 @@ def main() -> int:
     st, _ = call("GET", "/v1/models", key="wiit_totally_made_up_key")
     record("forged key rejected", st == 401, f"HTTP {st}")
 
-    # ------------------------------------------------------------- routing
     print("\nModel routing")
     st, body = call("GET", "/v1/models", key=ak)
     models = [m["id"] for m in body.get("data", [])] if st == 200 else []
@@ -159,7 +146,6 @@ def main() -> int:
         return 1
     model = working[0]
 
-    # ------------------------------------------------------------ metering
     print("\nUsage metering")
     before = usage_for(alice).get(model, {}).get("requests", 0)
     call("POST", "/v1/chat/completions", {
@@ -174,7 +160,6 @@ def main() -> int:
            after.get("prompt_tokens", 0) > 0 and after.get("completion_tokens", 0) > 0,
            f"{after.get('prompt_tokens')}p / {after.get('completion_tokens')}c")
 
-    # ----------------------------------------------------------- streaming
     print("\nStreaming")
     before = usage_for(alice).get(model, {}).get("completion_tokens", 0)
     st, text = call("POST", "/v1/chat/completions", {
@@ -188,7 +173,6 @@ def main() -> int:
     record("streamed request is metered (the hard case)", after > before,
            f"completion_tokens {before} -> {after}")
 
-    # ------------------------------------------------------ tenant isolation
     print("\nTenant isolation")
     if not dev_mode:
         record("second tenant", False, "needs AUTH_MODE=dev", skip=True)
@@ -216,13 +200,12 @@ def main() -> int:
         bu = usage_for(bob).get(model, {}).get("requests", 0)
         record("usage is per tenant", bu == 1 and au > 1, f"alice={au} bob={bu}")
 
-        # cache_salt only reaches vLLM-kind upstreams; the mock records it.
+        # cache_salt only reaches vLLM-kind upstreams; the mock records it
         salt_a = salt_b = None
         st, before_last = mock_get("/debug/last")
         seq_before = before_last.get("seq") if isinstance(before_last, dict) else None
         if st == 200 and seq_before is not None:
-            # Confirm the broker actually routes to THIS mock; a stale reading
-            # from an unrelated mock would otherwise fake a pass.
+            # Confirm the broker actually routes to THIS mock
             call("POST", "/v1/chat/completions", {
                 "model": model, "messages": [{"role": "user", "content": "probe"}]}, key=ak)
             _, probe = mock_get("/debug/last")
@@ -244,7 +227,6 @@ def main() -> int:
             record("cache_salt differs per tenant (blocks cache-timing leak)",
                    bool(salt_a) and salt_a != salt_b)
 
-    # --------------------------------------------------------- rate limiting
     print("\nRate limiting")
     rl_user = f"verify-rl-{uuid.uuid4().hex[:8]}"
     rk = new_key(rl_user)
@@ -262,7 +244,6 @@ def main() -> int:
         record("limit is not absurdly low", codes.index(429) >= 10,
                f"allowed {codes.index(429)}")
 
-    # ------------------------------------------------------------ revocation
     print("\nRevocation")
     st, keys = call("GET", "/keys", user=alice)
     st, _ = call("DELETE", f"/keys/{keys[0]['id']}", user=alice)
@@ -272,7 +253,6 @@ def main() -> int:
     st, _ = call("DELETE", "/keys/not-a-uuid", user=alice)
     record("bad key id gives 404 not 500", st == 404, f"HTTP {st}")
 
-    # ----------------------------------------------------------------- done
     failed = [r for r in results if r[0] == "FAIL"]
     skipped = [r for r in results if r[0] == "SKIP"]
     passed = [r for r in results if r[0] == "PASS"]

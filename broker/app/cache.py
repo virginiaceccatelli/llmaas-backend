@@ -1,5 +1,5 @@
-"""Redis connection. Used for fast rate-limit counters only.
-"""
+# Redis connection. Used for fast rate-limit counters only.
+
 import redis.asyncio as redis
 
 _client: redis.Redis | None = None
