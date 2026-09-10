@@ -9,10 +9,18 @@
 | Broker end-to-end | verified against real Postgres, in `dev` and `hs256` auth modes |
 | Tests | 30 unit + 9 smoke + 29 deep checks, all passing |
 | Hugging Face upstream | working (credits reset); offline mock also available |
+| **Frontend** | **exists** — `llmaas-frontend`, checked out here as the `frontend/` submodule |
+| **Cross-repo contracts** | `contracts/` + `.github/workflows/contract.yml` |
 | Docker | engine broken, needs admin — see [below](#docker-on-this-laptop) |
 
 The one-time setup below is **already done on this machine**. It is written
 down for a fresh machine, and for whoever joins the project next.
+
+> **This repo now contains a git submodule.** `frontend/` is the
+> `llmaas-frontend` repo, pinned to a specific commit. If that directory is
+> empty, run `git submodule update --init --recursive` — nothing below works
+> without it. The reasoning is in
+> [INTEGRATION_PLAN.md](INTEGRATION_PLAN.md#1-the-frontend-question--answer-this-first-because-everything-else-assumes-it).
 
 ---
 
@@ -23,9 +31,13 @@ down for a fresh machine, and for whoever joins the project next.
 | **Python venv** | once | Editor autocomplete, linting, running the broker directly |
 | **PostgreSQL** | yes | The one hard dependency. `scripts\local_postgres.ps1` needs no admin |
 | **Redis** | not on Windows | Set `RATE_LIMIT_BACKEND=memory`. Real Redis comes with Docker/the VM |
-| **Envoy AI Gateway** | **not yet** | Phase 2, and Kubernetes-native. See below |
-| **Vault** | **not yet** | Phase 2. `.env` is the PoC secret store |
+| **Envoy AI Gateway** | **not yet** | [Phase 5](INTEGRATION_PLAN.md#phase-5--envoy-ai-gateway), and Kubernetes-native. See below |
+| **Vault** | **not yet** | [Phase 6](INTEGRATION_PLAN.md#phase-6--vault-optional). `.env` is the PoC secret store |
 | **Docker** | blocked here | See [Docker on this laptop](#docker-on-this-laptop) |
+
+The frontend needs **nothing extra installed**: it is FastAPI + plain HTML/JS
+with no build step, and its `requirements.txt` overlaps the broker's almost
+entirely. It does want its own venv, because it does not need `asyncpg`.
 
 **You do not install Postgres/Redis/Vault/Envoy one by one.** That is the whole
 point of `docker-compose.yml` — it pulls those as images. The list above is only
@@ -41,7 +53,10 @@ about the *fallback* path for a laptop where Docker won't run.
 ## One-time setup
 
 ```powershell
-cd C:\Users\virginia.ceccatelli\Documents\LLMaaS
+# 0. clone WITH the frontend submodule
+git clone --recurse-submodules https://github.com/virginiaceccatelli/llmaas-backend.git
+cd llmaas-backend
+#    already cloned without it?  git submodule update --init --recursive
 
 # 1. venv — Python 3.12, NOT your default 3.14 (asyncpg has no 3.14 wheels yet)
 py -3.12 -m venv .venv
@@ -55,6 +70,37 @@ Copy-Item .env.example .env
 # 3. PostgreSQL — portable, no admin, no installer, no service
 .\scripts\local_postgres.ps1 setup
 ```
+
+Run step 0 **somewhere other than inside this repo.** Cloning it into itself
+gives you a `llmaas-backend/` directory nested in the working tree; it is
+gitignored so `git status` stays quiet about it, but it is dead weight and
+confusing to grep through. Delete it if you find one.
+
+### Setting up the frontend too
+
+Only if you want to run the two tiers directly, without Docker. Its own venv,
+because it does not need `asyncpg`:
+
+```powershell
+cd frontend
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+```
+
+Then set these in `frontend\.env`, matching the broker's:
+
+```ini
+BROKER_URL=http://127.0.0.1:8080
+BROKER_AUTH_MODE=hs256
+AUTH_JWT_SECRET=<byte-identical to the broker's .env>
+AUTH_JWT_ISSUER=llmaas-frontend
+AUTH_JWT_AUDIENCE=llmaas-broker
+```
+
+`BROKER_AUTH_MODE` must match the broker's `AUTH_MODE` or the frontend refuses
+to start. The full contract is [contracts/control_token.md](../contracts/control_token.md).
 
 If `Activate.ps1` is blocked by execution policy (this does **not** need admin):
 
@@ -87,9 +133,15 @@ AUTH_MODE=dev
 
 ```powershell
 cd C:\Users\virginia.ceccatelli\Documents\LLMaaS
+git pull --recurse-submodules         # keeps frontend/ at the pinned commit
 .\.venv\Scripts\Activate.ps1          # prompt becomes (.venv) PS>
 .\scripts\local_postgres.ps1 start    # no-op if already running
 ```
+
+**Use `--recurse-submodules` on every pull.** A plain `git pull` updates this
+repo but leaves `frontend/` at whatever commit it was on, so you end up testing
+the broker against a frontend nobody pinned. `git submodule status` shows a
+leading `+` when that has happened.
 
 Then one terminal each:
 
@@ -100,11 +152,96 @@ uvicorn server:app --app-dir serving\mock --port 8000
 # terminal 2 — the broker, reloads on every save
 uvicorn app.main:app --reload --app-dir broker --port 8080
 
-# terminal 3 — exercise it
-python scripts\smoke.py     # 9 quick end-to-end checks
-python scripts\verify.py    # 29 deep checks (see below)
-pytest -q                   # 30 unit tests
+# terminal 3 — the frontend, if you are working on the UI or the BFF
+cd frontend ; .\.venv\Scripts\Activate.ps1
+uvicorn app.main:app --reload --port 8081        # then open localhost:8081
+
+# terminal 4 — exercise it
+python scripts\smoke.py            # 9 quick end-to-end checks (broker)
+python scripts\verify.py           # 29 deep checks (broker)
+pytest -q                          # 30 unit tests
+python frontend\scripts\smoke.py   # the frontend's own suite, if it is running
 ```
+
+Working on the broker alone? Skip terminal 3 — nothing about the broker needs
+the frontend running.
+
+### The whole stack in one command (needs Docker)
+
+`docker-compose.full.yml` brings up postgres + redis + broker + frontend
+together. This is the file that proves the two tiers still agree, and it runs
+`hs256` rather than `dev`, so it exercises the real signature path:
+
+```powershell
+# .env needs POSTGRES_PASSWORD, AUTH_JWT_SECRET and SESSION_SECRET set
+docker compose -f docker-compose.full.yml up --build
+
+# offline variant — the mock upstream instead of Hugging Face, no credits spent
+$env:MODELS_MOUNT = ".\serving\models.ci.yaml"
+docker compose -f docker-compose.full.yml --profile ci up --build
+```
+
+The frontend lands on <http://127.0.0.1:8081>, the broker on `:8080`. This is
+**not** a deployment artifact — the real deployments stay one compose file per
+VM (`docker-compose.yml`, `frontend/docker-compose.yml`,
+`serving/docker-compose.vllm.yml`).
+
+### Before you push
+
+```powershell
+pytest -q
+python contracts\check_drift.py          # shared dependency pins still agree
+python contracts\dump_openapi.py --check # the broker's HTTP surface is unchanged
+```
+
+Both contract checks take about a second. The first is stdlib-only. The second
+fails when you have changed a route or a response model — regenerate with
+`python contracts\dump_openapi.py`, then check whether the frontend BFF reads
+the field you just renamed.
+
+### Working across the two repos
+
+`frontend/` is a submodule: a **pointer to a commit** in another repo, not a
+copy of its files. Editing inside it edits that repo, and this repo records only
+which commit you were on.
+
+**Changing frontend code** is two commits, in this order:
+
+```powershell
+cd frontend
+git switch main                       # submodules check out DETACHED by default;
+                                      # commit without this and the work is
+                                      # orphaned the next `submodule update`
+# ...edit, test...
+git commit -am "whatever"
+git push
+cd ..
+git add frontend                      # <- records the new pointer
+git commit -m "bump frontend: whatever"
+```
+
+Forgetting the last two lines is the classic submodule mistake: the frontend
+repo has your change, this repo still points at the old commit, and CI keeps
+testing the version before your fix.
+
+**Changing something both tiers share** — the JWT claims, a `/keys` response
+field, a public model name — belongs in one commit *pair*: frontend first, then
+the pointer bump here, so the two are recorded as having been verified together.
+See [contracts/](../contracts/README.md).
+
+**Picking up someone else's frontend change:**
+
+```powershell
+cd frontend ; git pull origin main ; cd ..
+git add frontend ; git commit -m "bump frontend to latest main"
+```
+
+| Symptom | What happened |
+|---|---|
+| `frontend/` is empty | Cloned without `--recurse-submodules`. Run `git submodule update --init --recursive` |
+| `git submodule status` shows `+<sha>` | Your `frontend/` is not on the pinned commit — either bump the pointer or `git submodule update` to snap back |
+| `git submodule status` shows `-<sha>` | Not initialised. Same fix as the first row |
+| Your frontend commit vanished | It was made on a detached HEAD. `git switch main` **before** editing; recover with `git reflog` inside `frontend/` |
 
 ### The three test layers
 
@@ -173,8 +310,20 @@ $env:LLMAAS_CONTROL_TOKEN = (python scripts\make_token.py --user alice)
 python scripts\smoke.py
 ```
 
-`scripts\make_token.py` stands in for the frontend BFF, which will mint these
-tokens once it exists. Details in [AUTH.md](AUTH.md).
+`scripts\make_token.py` mints the same token the frontend BFF's
+`mint_control_token` does, so you can exercise `hs256` without running the
+frontend at all. Details in [AUTH.md](AUTH.md), exact claims in
+[contracts/control_token.md](../contracts/control_token.md).
+
+> **Watch the issuer and audience.** `make_token.py` reads its defaults from
+> `.env`, where both are commented out — but the broker only *checks* them when
+> they are set. If you set `AUTH_JWT_ISSUER` / `AUTH_JWT_AUDIENCE` on the broker
+> and mint a token without them, every call 401s with `invalid token`. Pass them
+> explicitly when the two disagree:
+>
+> ```powershell
+> python scripts\make_token.py --user alice --issuer llmaas-frontend --audience llmaas-broker
+> ```
 
 ### Handy commands
 
@@ -185,6 +334,9 @@ tokens once it exists. Details in [AUTH.md](AUTH.md).
 pytest -q                              # 30 unit tests
 ruff check . ; ruff format .           # lint + format
 python scripts\make_token.py --user alice
+python contracts\check_drift.py        # dependency pins agree across both tiers
+python contracts\dump_openapi.py       # regenerate the broker's HTTP surface
+git submodule status                   # which frontend commit am I pinned to?
 git switch -c feature/whatever         # branch per change
 ```
 
@@ -194,11 +346,13 @@ git switch -c feature/whatever         # branch per change
 |---|---|
 | Python code in `broker/` | nothing — `--reload` picks it up |
 | `serving/mock/server.py` | restart the mock (it runs without `--reload`) |
-| `broker/requirements.txt` | `pip install -r broker\requirements-dev.txt` |
+| `broker/requirements.txt` | `pip install -r broker\requirements-dev.txt`, then `python contracts\check_drift.py` — if the package is shared, the frontend needs the same bump |
 | `db/init.sql` | `.\scripts\local_postgres.ps1 reset` (destroys local data) |
-| `serving/models.*.yaml` | restart the broker — the registry loads at startup |
-| `.env` | restart the broker |
-| Anything in `security.py` | run `pytest -q` before committing |
+| `serving/models.*.yaml` | restart the broker — the registry loads at startup. Change a **public model name** and you must change it in `models.dev/ci/prod.yaml` together, or the frontend's picker offers a model the broker 404s |
+| `.env` | restart the broker. Touched `AUTH_*`? The frontend's `.env` needs the same values |
+| Anything in `security.py` | `pytest -q` before committing |
+| A route or response model in `routers/` | `python contracts\dump_openapi.py` and commit the diff; check whether the BFF reads the field you changed |
+| Anything under `frontend/` | two commits — see [Working across the two repos](#working-across-the-two-repos) |
 
 ---
 
@@ -220,6 +374,11 @@ Every row here is an error we actually hit while building this.
 | `asyncpg` fails to build during install | You used Python 3.14. Rebuild the venv with `py -3.12` |
 | Empty `content` from `qwen-thinking` | It is a reasoning model — raise `max_tokens` to 512 or more |
 | A streamed request bills 0 tokens | The client disconnected before the final usage frame. Consume the whole stream |
+| `frontend/requirements.txt not found` from `check_drift.py` | The submodule is not checked out: `git submodule update --init --recursive` |
+| `BROKER_AUTH_MODE must be one of ('dev', 'hs256')` | The frontend cannot do `oidc` yet — the broker can. See [contracts/control_token.md](../contracts/control_token.md) |
+| Frontend says `the broker is unreachable` | The broker is not running, or `BROKER_URL` in `frontend\.env` is wrong. The BFF deliberately does not name the address in the error |
+| Frontend 401s on every key/usage call | `AUTH_JWT_SECRET` differs between the two `.env` files, or one side sets `AUTH_JWT_ISSUER`/`AUDIENCE` and the other does not |
+| CI fails on `openapi.broker.json is stale` | You changed a route. `python contracts\dump_openapi.py` and commit the diff |
 
 ---
 
@@ -255,10 +414,13 @@ actually ships. Zero drift between your dev box and the gateway VM.
 sudo apt update && sudo apt install -y docker.io docker-compose-v2 git
 sudo usermod -aG docker $USER && newgrp docker
 
-git clone <your-repo> && cd LLMaaS
-cp .env.example .env && nano .env      # set HF_TOKEN
-docker compose up -d --build
+git clone --recurse-submodules \
+  https://github.com/virginiaceccatelli/llmaas-backend.git && cd llmaas-backend
+cp .env.example .env && nano .env      # HF_TOKEN, POSTGRES_PASSWORD,
+                                       # AUTH_JWT_SECRET, SESSION_SECRET
+docker compose -f docker-compose.full.yml up -d --build   # both tiers
 python3 scripts/smoke.py
+python3 frontend/scripts/smoke.py
 ```
 
 Edit from Windows with **VS Code + the Remote-SSH extension** — you get your
@@ -282,7 +444,10 @@ Docker. And it would replace `broker/app/routers/chat.py`, code you are still
 actively changing. The broker already does auth, routing and rate limiting.
 Adopt Envoy when you hit one of the triggers in
 [gateway/README.md](../gateway/README.md) — Python proxying becomes a
-bottleneck, you need token-based limits, or you move to Kubernetes.
+bottleneck, you need token-based limits, or you move to Kubernetes. Two
+integration problems need a spike before you commit to it — per-tenant
+`cache_salt` and usage metering both live in code Envoy would delete. See
+[INTEGRATION_PLAN.md, Phase 5](INTEGRATION_PLAN.md#phase-5--envoy-ai-gateway).
 
 **Vault.** Same logic: `.env` is a fine PoC secret store, and `.env` is
 gitignored. Vault matters when there are real credentials and more than one
@@ -298,9 +463,14 @@ Neither is on the critical path to a working PoC.
 1. Backend skeleton — **done**
 2. `require_user` implemented (`dev` / `hs256` / `oidc`) — **done**
 3. End-to-end verified against Postgres + the mock upstream — **done**
-4. Get containers working (Path B, or Path C + Path A in parallel)
-5. Frontend repo: React + FastAPI BFF, login, chat view, key page.
-   Have the BFF mint `hs256` tokens, and set `AUTH_MODE=hs256` on the broker
-6. Real vLLM on a GPU VM; swap `models.dev.yaml` → `models.prod.yaml`
-7. TLS everywhere, then Vault for secrets
-8. Envoy AI Gateway, if and when the triggers hit
+4. Frontend BFF: login, chat view, key page, `hs256` tokens — **done**
+5. The two repos linked, with contract checks — **done**
+6. Get containers working (Path B, or Path C + Path A in parallel) — the last
+   thing blocking a full-stack run on this laptop
+
+From here the plan has its own document:
+**[INTEGRATION_PLAN.md](INTEGRATION_PLAN.md)** — OpenStack, PostgreSQL
+hardening, vLLM, Redis, Envoy and Vault, in dependency order, with the code
+changes each one needs and its effect on the frontend. Do not re-derive the
+ordering here; that file is the source of truth and this one is about the
+laptop.
