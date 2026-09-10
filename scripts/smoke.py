@@ -15,6 +15,14 @@ BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8080"
 # With AUTH_MODE=dev, leave it unset and the X-Dev-User header is used.
 CONTROL_TOKEN = os.environ.get("LLMAAS_CONTROL_TOKEN", "")
 
+# No token handed to us? If AUTH_JWT_SECRET is configured (in the environment
+# or in .env), mint one — the broker is in hs256 and the X-Dev-User fallback
+# below would just get a "missing bearer token" 401. With AUTH_MODE=dev there
+# is no secret, this stays empty, and the dev header is used as before.
+if not CONTROL_TOKEN:
+    from _env import mint_token
+    CONTROL_TOKEN = mint_token("demo-user")
+
 
 def call(method: str, path: str, body=None, token=None, user="demo-user"):
     req = urllib.request.Request(BASE + path, method=method)

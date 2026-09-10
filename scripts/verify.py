@@ -3,9 +3,6 @@
     python scripts/verify.py http://127.0.0.1:8091
     deeper smoke test: streaming, metering accuracy, multi-model routing, rate limiting, tenant isolation, and the error paths. 
 """
-import base64
-import hashlib
-import hmac
 import json
 import os
 import sys
@@ -14,47 +11,24 @@ import urllib.error
 import urllib.request
 import uuid
 
+from _env import mint_token, settings
+
 BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8080").rstrip("/")
 CONTROL_TOKEN = os.environ.get("LLMAAS_CONTROL_TOKEN", "")
 MOCK_URL = os.environ.get("MOCK_URL", "http://127.0.0.1:8000").rstrip("/")
 
-# When the broker runs AUTH_MODE=hs256 we can mint a token per user, exactly
-# as the frontend BFF does. Without this, a single LLMAAS_CONTROL_TOKEN makes
-# every control-plane call act as ONE user, and the checks below that assume
-# "alice" and "bob" are different people quietly compare a user against
-# itself — passing or failing for the wrong reason. Set the same three values
-# the broker has.
-AUTH_JWT_SECRET = os.environ.get("AUTH_JWT_SECRET", "")
-AUTH_JWT_ISSUER = os.environ.get("AUTH_JWT_ISSUER", "")
-AUTH_JWT_AUDIENCE = os.environ.get("AUTH_JWT_AUDIENCE", "")
-CAN_MINT = bool(AUTH_JWT_SECRET)
+# Credentials come from .env overlaid with the environment, so this works with
+# no setup in whichever mode the broker is running.
+#
+# When the broker runs hs256 we mint a token PER USER, exactly as the frontend
+# BFF does. Without that, a single LLMAAS_CONTROL_TOKEN makes every
+# control-plane call act as ONE user, and the checks below that assume "alice"
+# and "bob" are different people quietly compare a user against itself —
+# passing or failing for the wrong reason.
+ENV = settings()
+CAN_MINT = bool(ENV.get("AUTH_JWT_SECRET"))
 
 results: list[tuple[str, str, str]] = []
-
-
-def _b64(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
-
-
-def mint_token(sub: str, ttl_s: int = 600) -> str:
-    """HS256 JWT for `sub`. Hand-rolled to keep this script stdlib-only.
-
-    Same claims as the frontend's broker.mint_control_token and
-    scripts/make_token.py — see contracts/control_token.md.
-    """
-    header = _b64(json.dumps({"alg": "HS256", "typ": "JWT"},
-                             separators=(",", ":")).encode())
-    now = int(time.time())
-    claims = {"sub": sub, "iat": now, "exp": now + ttl_s}
-    if AUTH_JWT_ISSUER:
-        claims["iss"] = AUTH_JWT_ISSUER
-    if AUTH_JWT_AUDIENCE:
-        claims["aud"] = AUTH_JWT_AUDIENCE
-    payload = _b64(json.dumps(claims, separators=(",", ":")).encode())
-    signing_input = f"{header}.{payload}".encode()
-    sig = _b64(hmac.new(AUTH_JWT_SECRET.encode(), signing_input,
-                        hashlib.sha256).digest())
-    return f"{header}.{payload}.{sig}"
 
 
 def call(method, path, body=None, key=None, user=None, raw=False, timeout=120):
@@ -65,7 +39,7 @@ def call(method, path, body=None, key=None, user=None, raw=False, timeout=120):
         req.add_header("Authorization", f"Bearer {key}")
     elif user and CAN_MINT:
         # Control plane, hs256: one token per user, so `user` means something.
-        req.add_header("Authorization", f"Bearer {mint_token(user)}")
+        req.add_header("Authorization", f"Bearer {mint_token(user, ENV)}")
     elif user:
         # Control plane, dev mode: the broker trusts this header.
         req.add_header("X-Dev-User", user)
@@ -313,18 +287,36 @@ def main() -> int:
     rl_user = f"verify-rl-{uuid.uuid4().hex[:8]}"
     rk = new_key(rl_user)
     codes = []
+    # The limiter is a FIXED window keyed on the wall-clock minute, so this
+    # loop is only meaningful if it finishes inside one window. On a slow
+    # machine 70 sequential requests can take several minutes, the counter
+    # resets under us, and "no 429" says nothing about the limiter. Track the
+    # window so a timing artefact reports as SKIP rather than a false FAIL.
+    window_start = int(time.time()) // 60
     for _ in range(70):
         st, _ = call("GET", "/v1/models", key=rk, timeout=10)
         codes.append(st)
         if st == 429:
             break
+    window_end = int(time.time()) // 60
     limited = 429 in codes
-    record("rate limit eventually triggers", limited,
-           f"429 after {codes.index(429) + 1} requests" if limited
-           else f"no 429 in {len(codes)} requests")
+    crossed = window_end != window_start
+
     if limited:
+        record("rate limit eventually triggers", True,
+               f"429 after {codes.index(429) + 1} requests")
         record("limit is not absurdly low", codes.index(429) >= 10,
                f"allowed {codes.index(429)}")
+    elif crossed:
+        record("rate limit eventually triggers", False,
+               f"inconclusive — {len(codes)} requests spanned "
+               f"{window_end - window_start + 1} fixed windows, so the counter "
+               f"reset before reaching the limit. Lower RATE_LIMIT_PER_MIN or "
+               f"run somewhere faster.", skip=True)
+    else:
+        # Stayed inside one window and still never tripped: a real failure.
+        record("rate limit eventually triggers", False,
+               f"no 429 in {len(codes)} requests within a single window")
 
     print("\nRevocation")
     st, keys = call("GET", "/keys", user=alice)
