@@ -1,0 +1,147 @@
+# The WHOLE stack on one host: postgres + redis + broker + frontend.
+#
+#   docker compose -f docker-compose.full.yml up --build
+#
+# This is NOT a deployment artifact. It is the file that proves the two tiers
+# still agree with each other before either one is deployed. The real
+# deployments stay split, one compose file per VM:
+#
+#   docker-compose.yml                  -> the gateway/broker VM
+#   frontend/docker-compose.yml         -> the frontend VM
+#   serving/docker-compose.vllm.yml     -> the GPU VM
+#
+# The frontend comes from the git submodule at ./frontend, so this file only
+# works after:  git submodule update --init --recursive
+#
+# Everything is bound to 127.0.0.1: on a laptop that is all you need, and on a
+# VM it means an accidental `docker compose -f docker-compose.full.yml up`
+# cannot publish the broker or the database on a public interface.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-llmaas}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-llmaas}
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pgdata-full:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-llmaas}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    # noeviction is a correctness choice, not tuning: an LRU policy would
+    # silently drop rate-limit counters under pressure, resetting a customer's
+    # limit to zero. See docs/INTEGRATION_PLAN.md, Phase 4.
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  broker:
+    build: ./broker
+    env_file: .env
+    environment:
+      # Every one of these is set EXPLICITLY because .env carries the
+      # laptop values (127.0.0.1 hosts, RATE_LIMIT_BACKEND=memory,
+      # MODELS_FILE=./serving/...) and an `environment:` entry wins over
+      # `env_file:`. Without these the container silently uses the laptop
+      # settings and fails in confusing ways.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-llmaas}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:-llmaas}
+      REDIS_URL: redis://redis:6379/0
+      MODELS_FILE: /srv/models.yaml
+      RATE_LIMIT_BACKEND: redis
+      # hs256, not dev: the point of this file is to exercise the REAL
+      # control-plane path between the tiers. dev mode would prove nothing —
+      # it accepts an unverified header.
+      AUTH_MODE: hs256
+      AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:?generate one and put the SAME value in .env for both tiers}
+      AUTH_JWT_ISSUER: ${AUTH_JWT_ISSUER:-llmaas-frontend}
+      AUTH_JWT_AUDIENCE: ${AUTH_JWT_AUDIENCE:-llmaas-broker}
+    volumes:
+      # Default: Hugging Face's router, real model output, no GPU. CI sets
+      # MODELS_MOUNT=./serving/models.ci.yaml instead, so the pipeline needs
+      # no HF token and cannot be broken by the free tier running out.
+      - ${MODELS_MOUNT:-./serving/models.dev.yaml}:/srv/models.yaml:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    environment:
+      # The compose network, not host.docker.internal — both tiers are here.
+      BROKER_URL: http://broker:8080
+      BROKER_AUTH_MODE: hs256
+      # Byte-identical to the broker's, above. This is the one shared secret
+      # that must match across the two tiers; getting it wrong 401s every
+      # control-plane call. See contracts/control_token.md.
+      AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:?}
+      AUTH_JWT_ISSUER: ${AUTH_JWT_ISSUER:-llmaas-frontend}
+      AUTH_JWT_AUDIENCE: ${AUTH_JWT_AUDIENCE:-llmaas-broker}
+      SESSION_SECRET: ${SESSION_SECRET:?generate one and put it in .env}
+      # Local only. There is no users.json mounted here, so anyone may sign in
+      # as any user id. Never set this true on anything reachable by a network.
+      ALLOW_PASSWORDLESS: "true"
+      COOKIE_SECURE: "false"      # no TLS terminator in front of this file
+    ports:
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      broker: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8081/api/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # The offline upstream, for CI and for working with no HF credits. Not part
+  # of any deployment — the gateway VM talks to real vLLM. It reuses the
+  # broker's image because serving/mock/server.py needs only fastapi and
+  # pydantic, both already in there.
+  #
+  #   docker compose -f docker-compose.full.yml --profile ci up --build
+  #
+  # with MODELS_MOUNT=./serving/models.ci.yaml
+  mock-upstream:
+    profiles: ["ci"]
+    build: ./broker
+    volumes:
+      - ./serving/mock:/srv/mock:ro
+    command: ["uvicorn", "server:app", "--app-dir", "/srv/mock",
+              "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      # Published so scripts/verify.py can reach the mock's /debug/last and
+      # assert the per-tenant cache_salt actually arrived upstream. Without
+      # this that check SKIPS rather than fails, and the tenant-isolation
+      # property — the security focus in architecture.md — stops being tested.
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/v1/models')\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  # Its own volume, so bringing the full stack up does not collide with the
+  # gateway-VM stack's database in docker-compose.yml.
+  pgdata-full:

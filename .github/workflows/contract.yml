@@ -1,0 +1,97 @@
+# The mechanism behind "the two tiers cannot drift".
+#
+# Two jobs:
+#   checks - fast, no Docker. Dependency pins and the broker's HTTP surface.
+#   e2e    - the whole stack up, both repos' own test scripts run against it.
+#
+# The e2e job is the one that matters: it runs the FRONTEND's smoke suite
+# against THIS commit's broker, using the frontend commit this repo pins. That
+# is the only thing that actually proves the pair works together.
+
+name: contract
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Let the frontend repo trigger this after it merges, so a frontend change
+  # is checked against the broker too:
+  #   gh workflow run contract.yml --repo virginiaceccatelli/llmaas-backend
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive     # without this, frontend/ is an empty dir
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Stdlib only, so it runs before anything is installed and gives the
+      # fastest possible signal on a version skew.
+      - name: dependency pins agree across both tiers
+        run: python contracts/check_drift.py
+
+      - name: install broker deps
+        run: python -m pip install -r broker/requirements-dev.txt
+
+      - name: unit tests
+        run: pytest -q
+
+      - name: broker HTTP surface is unchanged
+        run: python contracts/dump_openapi.py --check
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Not real secrets: this stack is torn down with the runner. What is
+      # being tested is that the two tiers agree on HOW the secret is used,
+      # not the secret itself. hs256, never dev — dev mode proves nothing.
+      - name: bring up the full stack
+        env:
+          POSTGRES_PASSWORD: ci-postgres-password
+          AUTH_JWT_SECRET: ci-shared-jwt-secret-not-a-real-one
+          SESSION_SECRET: ci-session-secret-not-a-real-one
+          MODELS_MOUNT: ./serving/models.ci.yaml
+        run: |
+          cp .env.example .env
+          docker compose -f docker-compose.full.yml --profile ci up -d --build --wait
+
+      - name: broker deep checks
+        env:
+          AUTH_JWT_SECRET: ci-shared-jwt-secret-not-a-real-one
+        run: |
+          python -m pip install PyJWT
+          # --issuer/--audience must be passed explicitly: make_token.py reads
+          # its defaults from .env, where both are commented out, while the
+          # compose file DOES set them on the broker. A token minted without
+          # them fails verify_iss/verify_aud and every call 401s.
+          export LLMAAS_CONTROL_TOKEN=$(python scripts/make_token.py \
+            --user ci-user --issuer llmaas-frontend --audience llmaas-broker)
+          python scripts/smoke.py
+          python scripts/verify.py
+
+      # The point of the whole workflow: the frontend's own suite, unmodified,
+      # against this broker.
+      - name: frontend smoke suite
+        run: python frontend/scripts/smoke.py
+
+      - name: logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.full.yml --profile ci logs --no-color
+
+      - name: tear down
+        if: always()
+        run: docker compose -f docker-compose.full.yml --profile ci down -v

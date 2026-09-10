@@ -1,0 +1,29 @@
+# CI model registry — the offline mock, reached over the compose network.
+#
+# Same as models.mock.yaml, but the base_url is the compose service name
+# instead of 127.0.0.1: inside the broker container, 127.0.0.1 is the broker
+# itself, not the mock.
+#
+# Used by docker-compose.full.yml when MODELS_MOUNT=./serving/models.ci.yaml,
+# which is how CI runs. No HF token, no network, no credits — so the pipeline
+# cannot fail because a free tier ran out.
+#
+# The public names here MUST match models.dev.yaml and models.prod.yaml. That
+# is the contract with the frontend's model picker: the broker's /v1/models is
+# what fills it, so a name that exists only in one registry is a model the UI
+# offers and the broker 404s.
+
+models:
+  qwen-instruct:
+    # "vllm" so the broker also sends cache_salt; the mock asserts it arrives,
+    # which is how CI verifies tenant cache isolation is still wired up.
+    kind: vllm
+    base_url: http://mock-upstream:8000/v1
+    upstream_model: mock-qwen-instruct
+    api_key: ""          # the mock needs no credential
+
+  qwen-coder:
+    kind: vllm
+    base_url: http://mock-upstream:8000/v1
+    upstream_model: mock-qwen-coder
+    api_key: ""

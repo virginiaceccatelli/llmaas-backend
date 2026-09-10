@@ -18,3 +18,12 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
+# Frontend submodule secrets. The submodule has its own .gitignore, but these
+# are password hashes and a shared signing secret — be explicit.
+frontend/.env
+frontend/users.json
+
+# A clone of this repo inside itself. See docs/INTEGRATION_PLAN.md section 1:
+# the "cloning from now on" example is meant to be run somewhere ELSE.
+/llmaas-backend/

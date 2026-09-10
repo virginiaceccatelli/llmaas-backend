@@ -40,6 +40,8 @@ and a separate `llmaas-frontend`.
 │   └── mock/server.py         the offline stand-in upstream
 ├── tests/                   unit tests (30, all passing)
 ├── gateway/                 Envoy AI Gateway — empty until you need it
+├── docs/INTEGRATION_PLAN.md what still has to be built: vLLM, Envoy,
+│                            OpenStack, Postgres, Vault, Redis — in order
 ├── docs/WORKFLOW.md         daily workflow, local setup, what NOT to install
 ├── docs/AUTH.md             what auth exists, what you must build
 ├── docs/THIRD_PARTY.md      accounts you need to create
@@ -131,6 +133,9 @@ No code changes. That indirection is the whole point of `serving/models.*.yaml`.
 ---
 
 ## What is deliberately missing
+
+The ordered plan for all of it — including how the frontend repo gets linked to
+this one — is **[docs/INTEGRATION_PLAN.md](docs/INTEGRATION_PLAN.md)**.
 
 Every item below is marked with an `EXTEND:` comment at the exact place in the
 code where it belongs.
