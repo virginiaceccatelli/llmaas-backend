@@ -3,6 +3,9 @@
     python scripts/verify.py http://127.0.0.1:8091
     deeper smoke test: streaming, metering accuracy, multi-model routing, rate limiting, tenant isolation, and the error paths. 
 """
+import base64
+import hashlib
+import hmac
 import json
 import os
 import sys
@@ -15,18 +18,60 @@ BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8080").rstrip("/
 CONTROL_TOKEN = os.environ.get("LLMAAS_CONTROL_TOKEN", "")
 MOCK_URL = os.environ.get("MOCK_URL", "http://127.0.0.1:8000").rstrip("/")
 
+# When the broker runs AUTH_MODE=hs256 we can mint a token per user, exactly
+# as the frontend BFF does. Without this, a single LLMAAS_CONTROL_TOKEN makes
+# every control-plane call act as ONE user, and the checks below that assume
+# "alice" and "bob" are different people quietly compare a user against
+# itself — passing or failing for the wrong reason. Set the same three values
+# the broker has.
+AUTH_JWT_SECRET = os.environ.get("AUTH_JWT_SECRET", "")
+AUTH_JWT_ISSUER = os.environ.get("AUTH_JWT_ISSUER", "")
+AUTH_JWT_AUDIENCE = os.environ.get("AUTH_JWT_AUDIENCE", "")
+CAN_MINT = bool(AUTH_JWT_SECRET)
+
 results: list[tuple[str, str, str]] = []
+
+
+def _b64(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def mint_token(sub: str, ttl_s: int = 600) -> str:
+    """HS256 JWT for `sub`. Hand-rolled to keep this script stdlib-only.
+
+    Same claims as the frontend's broker.mint_control_token and
+    scripts/make_token.py — see contracts/control_token.md.
+    """
+    header = _b64(json.dumps({"alg": "HS256", "typ": "JWT"},
+                             separators=(",", ":")).encode())
+    now = int(time.time())
+    claims = {"sub": sub, "iat": now, "exp": now + ttl_s}
+    if AUTH_JWT_ISSUER:
+        claims["iss"] = AUTH_JWT_ISSUER
+    if AUTH_JWT_AUDIENCE:
+        claims["aud"] = AUTH_JWT_AUDIENCE
+    payload = _b64(json.dumps(claims, separators=(",", ":")).encode())
+    signing_input = f"{header}.{payload}".encode()
+    sig = _b64(hmac.new(AUTH_JWT_SECRET.encode(), signing_input,
+                        hashlib.sha256).digest())
+    return f"{header}.{payload}.{sig}"
 
 
 def call(method, path, body=None, key=None, user=None, raw=False, timeout=120):
     """Returns (status, parsed_or_text). Never raises on HTTP errors."""
     req = urllib.request.Request(BASE + path, method=method)
     if key:
+        # Data plane: an API key identifies itself, no user header needed.
         req.add_header("Authorization", f"Bearer {key}")
-    elif CONTROL_TOKEN:
-        req.add_header("Authorization", f"Bearer {CONTROL_TOKEN}")
+    elif user and CAN_MINT:
+        # Control plane, hs256: one token per user, so `user` means something.
+        req.add_header("Authorization", f"Bearer {mint_token(user)}")
     elif user:
+        # Control plane, dev mode: the broker trusts this header.
         req.add_header("X-Dev-User", user)
+    elif CONTROL_TOKEN:
+        # No user asked for — fall back to whoever the ambient token is.
+        req.add_header("Authorization", f"Bearer {CONTROL_TOKEN}")
     data = None
     if body is not None:
         data = body if isinstance(body, bytes) else json.dumps(body).encode()
@@ -44,6 +89,26 @@ def call(method, path, body=None, key=None, user=None, raw=False, timeout=120):
             return e.code, text
     except Exception as e:  # noqa: BLE001
         return 0, f"{type(e).__name__}: {e}"
+
+
+def broker_is_dev_mode() -> bool:
+    """Ask the broker, rather than guessing from our own environment.
+
+    Sends X-Dev-User and NO bearer token. Only AUTH_MODE=dev accepts that.
+    Guessing from env vars gets this wrong in a common case: AUTH_JWT_SECRET
+    left in .env while the broker runs dev. We would then mint tokens the
+    broker ignores, silently collapsing every user to DEV_USER_ID and making
+    the multi-tenant checks compare a user against itself.
+    """
+    req = urllib.request.Request(BASE + "/keys", method="GET")
+    req.add_header("X-Dev-User", "probe-dev-mode")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status == 200
+    except urllib.error.HTTPError:
+        return False
+    except Exception:  # noqa: BLE001 - unreachable is handled by the caller
+        return False
 
 
 def mock_get(path):
@@ -85,12 +150,28 @@ def main() -> int:
         print("\nBroker not reachable — start it first.\n")
         return 1
 
-    dev_mode = not CONTROL_TOKEN
-    st, _ = call("GET", "/keys", user="probe-dev-mode")
-    if not dev_mode:
-        record("auth mode", True, "token-based (multi-user checks will skip)")
+    # Ask the broker which mode it is in, then decide how to identify users.
+    # Can this run act as more than one user? Yes in dev mode (X-Dev-User is
+    # trusted) and in hs256 when we hold the signing secret. A bare
+    # LLMAAS_CONTROL_TOKEN with no secret is single-user.
+    global CAN_MINT
+    dev_mode = broker_is_dev_mode()
+    if dev_mode:
+        CAN_MINT = False        # tokens would be ignored; use the dev header
+    multi_user = dev_mode or CAN_MINT
+
+    if dev_mode:
+        record("auth mode", True, "dev (X-Dev-User trusted)")
+    elif CAN_MINT:
+        record("auth mode", True, "hs256 (minting a token per user)")
+    elif CONTROL_TOKEN:
+        record("auth mode", True,
+               "single token — multi-user checks will skip. Set "
+               "AUTH_JWT_SECRET to run them")
     else:
-        record("auth mode", st == 200, "dev (X-Dev-User trusted)")
+        record("auth mode", False,
+               "broker is not in dev mode and we have no token or secret")
+        return 1
 
     print("\nAPI keys")
     alice = f"verify-alice-{uuid.uuid4().hex[:8]}"
@@ -174,10 +255,11 @@ def main() -> int:
            f"completion_tokens {before} -> {after}")
 
     print("\nTenant isolation")
-    if not dev_mode:
-        record("second tenant", False, "needs AUTH_MODE=dev", skip=True)
-        record("cross-tenant key revocation blocked", False, "needs AUTH_MODE=dev", skip=True)
-        record("usage is per tenant", False, "needs AUTH_MODE=dev", skip=True)
+    if not multi_user:
+        why = "needs AUTH_MODE=dev, or AUTH_JWT_SECRET to mint per-user tokens"
+        record("second tenant", False, why, skip=True)
+        record("cross-tenant key revocation blocked", False, why, skip=True)
+        record("usage is per tenant", False, why, skip=True)
     else:
         bk = new_key(bob)
         record("second tenant can mint a key", bool(bk))

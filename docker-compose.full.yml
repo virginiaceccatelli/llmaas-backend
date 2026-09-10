@@ -62,6 +62,11 @@ services:
       REDIS_URL: redis://redis:6379/0
       MODELS_FILE: /srv/models.yaml
       RATE_LIMIT_BACKEND: redis
+      # Overridable because verify.py's rate-limit check sends a fixed 70
+      # requests and the limiter is a FIXED WINDOW: if those 70 straddle a
+      # minute boundary on a slow runner, neither window reaches 60 and the
+      # check reports "no 429 in 70 requests" — a false failure. CI sets 20.
+      RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-60}
       # hs256, not dev: the point of this file is to exercise the REAL
       # control-plane path between the tiers. dev mode would prove nothing —
       # it accepts an unverified header.

@@ -47,6 +47,27 @@ jobs:
 
   e2e:
     runs-on: ubuntu-latest
+    # JOB scope, not step scope. docker-compose.full.yml interpolates
+    # ${POSTGRES_PASSWORD:?} and friends on EVERY invocation, including
+    # `logs` and `down` — so a step without these in its environment fails
+    # with "required variable is not set" before Docker is even consulted.
+    # That is exactly how the teardown steps broke on the first run.
+    #
+    # Not real secrets: the stack dies with the runner. What is under test is
+    # that the two tiers agree on HOW the secret is used. hs256, never dev —
+    # dev mode accepts an unverified header and proves nothing.
+    env:
+      POSTGRES_PASSWORD: ci-postgres-password
+      AUTH_JWT_SECRET: ci-shared-jwt-secret-not-a-real-one
+      SESSION_SECRET: ci-session-secret-not-a-real-one
+      MODELS_MOUNT: ./serving/models.ci.yaml
+      # Low enough that verify.py's 70 requests trip it even if they straddle
+      # a minute boundary on a slow runner. Still above the >=10 floor that
+      # check asserts, so it also proves the limit is not absurdly low.
+      RATE_LIMIT_PER_MIN: "20"
+      AUTH_JWT_ISSUER: llmaas-frontend
+      AUTH_JWT_AUDIENCE: llmaas-broker
+      COMPOSE: docker compose -f docker-compose.full.yml --profile ci
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,31 +77,26 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Not real secrets: this stack is torn down with the runner. What is
-      # being tested is that the two tiers agree on HOW the secret is used,
-      # not the secret itself. hs256, never dev — dev mode proves nothing.
       - name: bring up the full stack
-        env:
-          POSTGRES_PASSWORD: ci-postgres-password
-          AUTH_JWT_SECRET: ci-shared-jwt-secret-not-a-real-one
-          SESSION_SECRET: ci-session-secret-not-a-real-one
-          MODELS_MOUNT: ./serving/models.ci.yaml
         run: |
           cp .env.example .env
-          docker compose -f docker-compose.full.yml --profile ci up -d --build --wait
+          $COMPOSE up -d --build --wait
 
+      # smoke.py takes a single ambient token. verify.py needs to act as
+      # several distinct users, so it mints its own from AUTH_JWT_SECRET
+      # (inherited from the job env) — otherwise every call collapses to one
+      # user and its key-listing, revocation and tenant checks compare a user
+      # against itself.
       - name: broker deep checks
-        env:
-          AUTH_JWT_SECRET: ci-shared-jwt-secret-not-a-real-one
         run: |
           python -m pip install PyJWT
-          # --issuer/--audience must be passed explicitly: make_token.py reads
-          # its defaults from .env, where both are commented out, while the
-          # compose file DOES set them on the broker. A token minted without
-          # them fails verify_iss/verify_aud and every call 401s.
+          # --issuer/--audience explicitly: make_token.py reads its defaults
+          # from .env, where both are commented out, while the broker DOES
+          # check them. A token minted without them 401s on verify_iss/aud.
           export LLMAAS_CONTROL_TOKEN=$(python scripts/make_token.py \
-            --user ci-user --issuer llmaas-frontend --audience llmaas-broker)
+            --user ci-user --issuer "$AUTH_JWT_ISSUER" --audience "$AUTH_JWT_AUDIENCE")
           python scripts/smoke.py
+          unset LLMAAS_CONTROL_TOKEN     # let verify.py mint per user
           python scripts/verify.py
 
       # The point of the whole workflow: the frontend's own suite, unmodified,
@@ -90,8 +106,8 @@ jobs:
 
       - name: logs on failure
         if: failure()
-        run: docker compose -f docker-compose.full.yml --profile ci logs --no-color
+        run: $COMPOSE logs --no-color
 
       - name: tear down
         if: always()
-        run: docker compose -f docker-compose.full.yml --profile ci down -v
+        run: $COMPOSE down -v
