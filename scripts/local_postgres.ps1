@@ -16,11 +16,12 @@
     .\scripts\local_postgres.ps1 stop
     .\scripts\local_postgres.ps1 status
     .\scripts\local_postgres.ps1 psql      # interactive shell
+    .\scripts\local_postgres.ps1 migrate   # apply db\migrations\*.sql (keeps data)
     .\scripts\local_postgres.ps1 reset     # DESTROYS data, reloads schema
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('setup', 'start', 'stop', 'status', 'psql', 'reset')]
+    [ValidateSet('setup', 'start', 'stop', 'status', 'psql', 'reset', 'migrate')]
     [string]$Action = 'setup',
 
     # Check https://www.enterprisedb.com/download-postgresql-binaries for the
@@ -155,6 +156,27 @@ switch ($Action) {
         $env:PGPASSWORD = $DbPass
         & (Join-Path $BinDir "psql.exe") -h 127.0.0.1 -p $Port -U $DbUser -d $DbName
     }
+    'migrate' {
+        # Apply db\migrations\*.sql in order, keeping existing data.
+        # db\init.sql only ever runs on a fresh database, so this is how an
+        # already-created one picks up a schema change. Each file is written
+        # to be idempotent, so re-running is safe.
+        Assert-Installed
+        if (-not (Test-Running)) { Start-Server }
+        $env:PGPASSWORD = $DbPass
+        $dir = Join-Path $RepoRoot "db\migrations"
+        if (-not (Test-Path $dir)) { Write-Host "No db\migrations directory."; break }
+        $files = Get-ChildItem -Path $dir -Filter *.sql | Sort-Object Name
+        if (-not $files) { Write-Host "No migrations to apply."; break }
+        foreach ($f in $files) {
+            Write-Host "Applying $($f.Name)" -ForegroundColor Cyan
+            Invoke-Pg 'psql.exe' @('-h', '127.0.0.1', '-p', $Port, '-U', $DbUser,
+                                   '-d', $DbName, '-v', 'ON_ERROR_STOP=1', '-q',
+                                   '-f', $f.FullName)
+        }
+        Write-Host "Migrations applied." -ForegroundColor Green
+    }
+
     'reset'  {
         Write-Host "This DELETES all local data in $DbName." -ForegroundColor Yellow
         $answer = Read-Host "Type 'yes' to continue"

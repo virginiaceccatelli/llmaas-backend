@@ -71,6 +71,11 @@ class Settings(BaseSettings):
 
     upstream_timeout_s: float = 120.0
 
+    # How often the background sweep revokes keys past their expires_at.
+    # Expiry is enforced on every request regardless; this only keeps the
+    # table tidy. See broker/app/reaper.py.
+    key_reap_interval_s: float = 300.0
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -53,13 +53,20 @@ async def require_key(
     # Lookup is by hash, so a database dump never yields usable keys
     async with db.pool().acquire() as conn:
         row = await conn.fetchrow(
-            """SELECT id, user_id, revoked, key_hash
+            """SELECT id, user_id, revoked, key_hash,
+                      (expires_at IS NOT NULL AND expires_at <= now()) AS expired
                  FROM api_keys
                 WHERE key_hash = $1""",
             hash_key(raw_key),
         )
     if row is None or row["revoked"]:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or revoked key")
+
+    # Checked here, not just by the reaper: expiry must take effect the moment
+    # it passes, whether or not a background job has swept yet. The reaper is
+    # hygiene; this is the control.
+    if row["expired"]:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "key expired")
 
     if not hmac.compare_digest(row["key_hash"], hash_key(raw_key)):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid key")

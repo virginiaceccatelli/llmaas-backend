@@ -250,6 +250,9 @@ git add frontend ; git commit -m "bump frontend to latest main"
 | `pytest -q` | Auth logic, registry validation, upstream error handling | no |
 | `scripts\smoke.py` | The happy path works end to end | yes |
 | `scripts\verify.py` | Streaming, metering accuracy, multi-model routing, rate limiting, tenant isolation, error paths | yes |
+| `scripts\isolation_check.py` | **Two users, one browser**: chat history, keys and usage stay separate. The PoC demo, as a test | broker **and** frontend |
+| `scripts\reaper_check.py` | Expired keys are revoked, and their usage rows survive | Postgres only |
+| `frontend\scripts\test_session_store.py` | The Redis session round trip, against a fake Redis so it runs anywhere | no |
 
 `verify.py` prints PASS / FAIL / SKIP per check and exits non-zero on failure.
 Run it against whichever broker you want to test:
@@ -347,7 +350,7 @@ git switch -c feature/whatever         # branch per change
 | Python code in `broker/` | nothing — `--reload` picks it up |
 | `serving/mock/server.py` | restart the mock (it runs without `--reload`) |
 | `broker/requirements.txt` | `pip install -r broker\requirements-dev.txt`, then `python contracts\check_drift.py` — if the package is shared, the frontend needs the same bump |
-| `db/init.sql` | `.\scripts\local_postgres.ps1 reset` (destroys local data) |
+| `db/init.sql` | it only runs on a FRESH database. To change an existing one add `db\migrations\NNN_*.sql` and run `.\scripts\local_postgres.ps1 migrate`; `reset` destroys local data and reloads from scratch |
 | `serving/models.*.yaml` | restart the broker — the registry loads at startup. Change a **public model name** and you must change it in `models.dev/ci/prod.yaml` together, or the frontend's picker offers a model the broker 404s |
 | `.env` | restart the broker. Touched `AUTH_*`? The frontend's `.env` needs the same values |
 | Anything in `security.py` | `pytest -q` before committing |

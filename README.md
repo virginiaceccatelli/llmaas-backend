@@ -40,8 +40,8 @@ and a separate `llmaas-frontend`.
 │   └── mock/server.py         the offline stand-in upstream
 ├── tests/                   unit tests (30, all passing)
 ├── gateway/                 Envoy AI Gateway — empty until you need it
-├── docs/INTEGRATION_PLAN.md what still has to be built: vLLM, Envoy,
-│                            OpenStack, Postgres, Vault, Redis — in order
+├── docs/NEXT_STEPS.md       START HERE — what to do next, in order
+├── docs/INTEGRATION_PLAN.md the reference: what each component needs — in order
 ├── docs/WORKFLOW.md         daily workflow, local setup, what NOT to install
 ├── docs/AUTH.md             what auth exists, what you must build
 ├── docs/THIRD_PARTY.md      accounts you need to create
@@ -162,7 +162,13 @@ code where it belongs.
 - Revocation checked on every request; key deletion cascades to usage rows.
 - Per-tenant `cache_salt` sent to vLLM, so the prefix/KV cache cannot be
   shared across tenants (blocks cache-timing leakage between customers).
-- vLLM runs with `--disable-log-requests`; no prompt or completion text is
-  stored anywhere in this repo's schema.
+- vLLM runs without request logging, so the **inference path** stores no
+  prompt or completion text.
+- **Chat history is the deliberate exception.** The `conversations` and
+  `messages` tables hold what users type and what the model replies, so a
+  user's history follows their account rather than their browser. That is a
+  change from the original design, which stored none. It still needs a
+  retention policy and a line in a privacy notice — see
+  [db/init.sql](db/init.sql).
 - Broker has no CORS middleware, by design — it must never be browser-reachable.
 - Container runs as a non-root user.

@@ -13,10 +13,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from . import cache, db, ratelimit, registry, security, upstream
+from . import cache, db, ratelimit, reaper, registry, security, upstream
 from . import config
 from .config import get_settings
-from .routers import chat, health, keys, usage
+from .routers import chat, conversations, health, keys, usage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +46,7 @@ async def lifespan(app: FastAPI):
             "on restart. Local development only — never run this way in prod."
         )
     await upstream.connect(settings.upstream_timeout_s)
+    reaper.start(settings.key_reap_interval_s)
 
     log.info(
         "broker ready — auth_mode=%s, models: %s",
@@ -55,6 +56,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    await reaper.stop()
     await upstream.disconnect()
     await cache.disconnect()   # no-op if it was never connected
     await db.disconnect()
@@ -69,6 +71,7 @@ app = FastAPI(
 app.include_router(health.router)
 app.include_router(keys.router)
 app.include_router(usage.router)
+app.include_router(conversations.router)
 app.include_router(chat.router)
 
 # NOTE: no CORS middleware on purpose. This service must never be reachable

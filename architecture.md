@@ -45,8 +45,25 @@ Envoy AI Gateway:
 ## Security & Isolation (the special focus)
 - **Network segmentation**: only the frontend tier is public; gateway and GPU nodes are private.
 - **Model isolation**: one vLLM process per model; no shared state between models.
-- **Tenant / cache isolation**: run vLLM with `--disable-log-requests` (no prompt logging) and a **per-tenant `cache_salt`** so the KV / prefix cache is never shared across customers (prevents the known cache-timing leakage between tenants). 
+- **Tenant / cache isolation**: run vLLM without request logging and with a **per-tenant `cache_salt`** so the KV / prefix cache is never shared across customers (prevents the known cache-timing leakage between tenants).
+- **Tenant data isolation**: API keys, usage records and chat history are all scoped by `user_id`; one user cannot read or delete another's, even by guessing an id.
 - **Secrets & transport**: TLS everywhere; API keys hashed at rest; all secrets in Vault.
+
+## Data we store
+
+| Data | Where | Notes |
+|---|---|---|
+| User ids, emails | `users` | identity itself lives in the IdP |
+| API keys | `api_keys` | SHA-256 only; plaintext shown once. `expires_at` backstops keys nobody revokes |
+| Token counts per request | `usage` | for billing. No message content |
+| **Chat history** | `conversations`, `messages` | **prompt and completion text.** Needed so history follows the account, not the browser |
+| Sessions | Redis | opaque sid in the cookie; user id, CSRF token and the session's API key stay server-side |
+
+Chat history is the one place user content is at rest. It is there because
+without it two people signing in to the same browser share one history, which
+is not a multi-tenant product. What it still needs before real customers: a
+retention policy, a line in the privacy notice, and access control on database
+backups, which now contain user content.
 
 ## Summary Table
 
